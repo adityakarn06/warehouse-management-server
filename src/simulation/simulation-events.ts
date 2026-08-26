@@ -1,4 +1,9 @@
-import type { TruckStatus } from '../generated/prisma/enums.js';
+import type {
+  AlertSeverity,
+  AlertType,
+  DelayScenario,
+  TruckStatus,
+} from '../generated/prisma/enums.js';
 import { logger } from '../lib/logger.js';
 
 /**
@@ -53,16 +58,38 @@ export interface TruckStatusPayload {
   shipmentId: string | null;
   previousStatus: TruckStatus;
   status: TruckStatus;
+  /** The scenario in force after the change, so a dashboard can label it
+   * ("RAIN") from this event alone rather than re-reading the truck. */
+  activeDelay: DelayScenario;
   progress: number;
+  speedKmph: number;
   eta: string | null;
   serverTimestamp: string;
   sequenceNumber: number;
 }
 
+/**
+ * Declared here rather than in `src/websocket/events.ts` for the same reason the
+ * truck payloads are: the engine is what emits it, and `events.ts` re-exports it
+ * so the two contracts cannot drift.
+ */
+export interface AlertCreatedPayload {
+  alertId: string;
+  type: AlertType;
+  severity: AlertSeverity;
+  title: string;
+  message: string;
+  truckId: string | null;
+  shipmentId: string | null;
+  dockDoorId: string | null;
+  createdAt: string;
+}
+
 export type SimulationEvent =
   | { type: 'TRUCK_POSITION_UPDATED'; data: TruckPositionPayload }
   | { type: 'TRUCK_ETA_UPDATED'; data: TruckEtaPayload }
-  | { type: 'TRUCK_STATUS_CHANGED'; data: TruckStatusPayload };
+  | { type: 'TRUCK_STATUS_CHANGED'; data: TruckStatusPayload }
+  | { type: 'ALERT_CREATED'; data: AlertCreatedPayload };
 
 export type SimulationEventType = SimulationEvent['type'];
 
@@ -79,6 +106,11 @@ export const loggerEventSink: SimulationEventSink = {
     if (event.type === 'TRUCK_STATUS_CHANGED') {
       const { reference, previousStatus, status } = event.data;
       logger.info(`${reference}: ${previousStatus} -> ${status}`);
+      return;
+    }
+    // An alert payload has no `reference` — and an alert is always worth a line.
+    if (event.type === 'ALERT_CREATED') {
+      logger.info(`Alert ${event.data.type} (${event.data.severity}): ${event.data.title}`);
       return;
     }
     logger.debug(`${event.type} ${event.data.reference}`, event.data);

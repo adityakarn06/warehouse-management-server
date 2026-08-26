@@ -1,6 +1,8 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { LocationSnapshotReason } from '../src/generated/prisma/enums.js';
 import { calculateEta, distanceTravelledKm } from '../src/eta/eta-engine.js';
+import type { AlertRecord, CreateAlertInput } from '../src/services/alert-service.js';
+import type { DelayMultipliers } from '../src/simulation/delay-scenarios.js';
 import type { LiveTruckState } from '../src/simulation/live-state.js';
 import { toLiveTruckView } from '../src/simulation/live-state.js';
 import {
@@ -65,6 +67,11 @@ interface PersistCall {
 class FakeStore implements SimulationStore {
   loadCount = 0;
   readonly persisted: PersistCall[] = [];
+  readonly alerts: CreateAlertInput[] = [];
+  /** Set to make the next createAlert reject, to prove the delay still lands. */
+  failAlerts = false;
+  /** Set to hold createAlert open, so a tick can try to interleave with it. */
+  alertGate: Promise<void> | null = null;
 
   constructor(private readonly rows: SimulationTruckRow[]) {}
 
@@ -84,6 +91,26 @@ class FakeStore implements SimulationStore {
       status: state.status,
       reason,
     });
+  }
+
+  async createAlert(input: CreateAlertInput): Promise<AlertRecord> {
+    if (this.alertGate !== null) await this.alertGate;
+    if (this.failAlerts) throw new Error('alert write failed');
+    this.alerts.push(input);
+    return {
+      id: `ALERT-${this.alerts.length}`,
+      type: input.type,
+      severity: input.severity,
+      title: input.title,
+      message: input.message,
+      truckId: input.truckId ?? null,
+      shipmentId: input.shipmentId ?? null,
+      dockDoorId: input.dockDoorId ?? null,
+      metadata: (input.metadata ?? null) as AlertRecord['metadata'],
+      acknowledged: false,
+      acknowledgedAt: null,
+      createdAt: new Date('2026-08-26T18:16:00.000Z'),
+    };
   }
 }
 
@@ -111,6 +138,17 @@ interface Harness {
   advance: (ms?: number) => Promise<void>;
 }
 
+/**
+ * Pinned rather than read from the environment, so a tuned .env cannot move the
+ * arithmetic these tests assert on.
+ */
+const MULTIPLIERS: DelayMultipliers = {
+  NORMAL: 1,
+  RAIN: 0.65,
+  TRAFFIC: 0.45,
+  ROAD_CLOSURE: 0.1,
+};
+
 function harness(rows: SimulationTruckRow[] = [truckRow()], checkpointStep = 5): Harness {
   const store = new FakeStore(rows);
   const sink = new FakeSink();
@@ -124,6 +162,7 @@ function harness(rows: SimulationTruckRow[] = [truckRow()], checkpointStep = 5):
     speedMultiplier: 1,
     arrivingProgress: 95,
     checkpointStep,
+    delayMultipliers: MULTIPLIERS,
   });
 
   return {
@@ -612,5 +651,383 @@ describe('simulation lifecycle', () => {
     expect(h.store.loadCount).toBe(2);
     // Reloaded from the store even though the loop stays stopped.
     expect(h.manager.getTruckState('TRK-TEST')?.progress).toBe(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+
+/**
+ * Delay scenarios (CLAUDE.md §7). The frontend only ever names a scenario; every
+ * number below is the backend's, which is exactly what these assert.
+ */
+describe('delay scenarios', () => {
+  beforeEach(() => clearRouteProfileCache());
+
+  /** Real milliseconds left until arrival, from the authoritative state. */
+  function remainingMsFor(h: Harness, at: number): number {
+    const eta = h.manager.getTruckState('TRK-TEST')?.eta;
+    if (!eta) throw new Error('expected an ETA');
+    return eta.getTime() - at;
+  }
+
+  async function movingHarness(rows?: SimulationTruckRow[]): Promise<Harness> {
+    const h = harness(rows);
+    await h.manager.start();
+    await h.advance(ONE_HOUR / 6); // 10 km in, so there is a journey left to slow
+    return h;
+  }
+
+  it('rain slows the truck and pushes its ETA out', async () => {
+    const h = await movingHarness();
+    const before = h.manager.getTruckState('TRK-TEST');
+    if (!before?.eta) throw new Error('expected a baseline ETA');
+
+    const { truck, alert } = await h.manager.applyDelay('TRK-TEST', 'RAIN');
+
+    expect(truck.activeDelay).toBe('RAIN');
+    expect(truck.status).toBe('DELAYED');
+    expect(truck.speedKmph).toBeCloseTo(60 * 0.65, 6);
+    // The base speed is untouched — it is what a clear restores.
+    expect(truck.baseSpeedKmph).toBeCloseTo(60, 6);
+    expect(truck.eta).not.toBeNull();
+    expect(truck.eta?.getTime()).toBeGreaterThan(before.eta.getTime());
+    expect(alert).not.toBeNull();
+
+    await h.manager.stop();
+  });
+
+  it('traffic slows the truck more than rain does', async () => {
+    const rain = await movingHarness();
+    const traffic = await movingHarness();
+
+    const rainState = await rain.manager.applyDelay('TRK-TEST', 'RAIN');
+    const trafficState = await traffic.manager.applyDelay('TRK-TEST', 'TRAFFIC');
+
+    expect(trafficState.truck.speedKmph).toBeLessThan(rainState.truck.speedKmph);
+
+    // Both were slowed from the same point at the same instant, so the ratio of
+    // the times remaining is exactly the inverse ratio of the multipliers.
+    const at = rainState.truck.lastUpdatedAt.getTime();
+    const ratio = remainingMsFor(traffic, at) / remainingMsFor(rain, at);
+    expect(ratio).toBeCloseTo(0.65 / 0.45, 3);
+
+    await rain.manager.stop();
+    await traffic.manager.stop();
+  });
+
+  it('a road closure is the strongest slowdown but still moves the truck', async () => {
+    const h = await movingHarness();
+    const { truck } = await h.manager.applyDelay('TRK-TEST', 'ROAD_CLOSURE');
+
+    expect(truck.speedKmph).toBeCloseTo(60 * 0.1, 6);
+
+    // A zero-speed truck covers no ground, which advanceTruck treats as "nothing
+    // to report" — it would go silent. A strong slowdown must still make progress.
+    const before = h.manager.getTruckState('TRK-TEST')?.progress ?? 0;
+    await h.advance(ONE_HOUR);
+    const after = h.manager.getTruckState('TRK-TEST')?.progress ?? 0;
+    expect(after).toBeGreaterThan(before);
+
+    await h.manager.stop();
+  });
+
+  it('clearing a delay restores the base speed and the normal ETA', async () => {
+    const h = await movingHarness();
+    const baseline = h.manager.getTruckState('TRK-TEST');
+    if (!baseline?.eta) throw new Error('expected a baseline ETA');
+
+    await h.manager.applyDelay('TRK-TEST', 'TRAFFIC');
+    const { truck, alert } = await h.manager.clearDelay('TRK-TEST');
+
+    expect(truck.activeDelay).toBe('NORMAL');
+    expect(truck.status).toBe('IN_TRANSIT');
+    expect(truck.speedKmph).toBeCloseTo(60, 6);
+    expect(truck.speedKmph).toBeCloseTo(truck.baseSpeedKmph, 6);
+    // Clearing raises no alert — §11 has no "delay cleared" type.
+    expect(alert).toBeNull();
+
+    // The clock has not moved between the baseline and here, so the restored ETA
+    // lands back on the original instant.
+    expect(truck.eta?.getTime()).toBeCloseTo(baseline.eta.getTime(), -1);
+
+    await h.manager.stop();
+  });
+
+  it('activating a delay creates exactly one alert and emits it', async () => {
+    const h = await movingHarness();
+    await h.manager.applyDelay('TRK-TEST', 'ROAD_CLOSURE');
+
+    expect(h.store.alerts).toHaveLength(1);
+    expect(h.store.alerts[0]).toMatchObject({
+      type: 'TRUCK_DELAYED',
+      severity: 'CRITICAL', // a closure is the one scenario that pages the tower
+      truckId: 'TRK-TEST',
+      shipmentId: 'SHP-TEST',
+    });
+    expect(h.store.alerts[0]?.metadata).toMatchObject({ delayType: 'ROAD_CLOSURE' });
+
+    const emitted = h.sink.ofType('ALERT_CREATED');
+    expect(emitted).toHaveLength(1);
+    expect(emitted[0]?.data.type).toBe('TRUCK_DELAYED');
+
+    // Clearing adds neither an alert nor an ALERT_CREATED.
+    await h.manager.clearDelay('TRK-TEST');
+    expect(h.store.alerts).toHaveLength(1);
+    expect(h.sink.ofType('ALERT_CREATED')).toHaveLength(1);
+
+    await h.manager.stop();
+  });
+
+  it('emits the ETA and status changes the command caused', async () => {
+    const h = await movingHarness();
+    const etaBefore = h.sink.ofType('TRUCK_ETA_UPDATED').length;
+
+    await h.manager.applyDelay('TRK-TEST', 'RAIN');
+
+    expect(h.sink.ofType('TRUCK_ETA_UPDATED').length).toBe(etaBefore + 1);
+    const status = h.sink.ofType('TRUCK_STATUS_CHANGED').at(-1)?.data;
+    expect(status).toMatchObject({
+      previousStatus: 'IN_TRANSIT',
+      status: 'DELAYED',
+      activeDelay: 'RAIN',
+    });
+
+    await h.manager.stop();
+  });
+
+  it('persists the scenario as a business event, not as tick chatter', async () => {
+    const h = await movingHarness();
+    const before = h.store.persisted.length;
+
+    await h.manager.applyDelay('TRK-TEST', 'RAIN');
+    await h.manager.clearDelay('TRK-TEST');
+
+    const reasons = h.store.persisted.slice(before).map((call) => call.reason);
+    expect(reasons).toEqual(['DELAY_ACTIVATED', 'DELAY_CLEARED']);
+
+    await h.manager.stop();
+  });
+
+  it('holds the delay across many ticks and moves at the reduced speed', async () => {
+    const h = await movingHarness();
+    await h.manager.applyDelay('TRK-TEST', 'TRAFFIC');
+    const start = h.manager.getTruckState('TRK-TEST')?.progress ?? 0;
+
+    for (let i = 0; i < 5; i += 1) {
+      await h.advance(ONE_HOUR / 6);
+    }
+
+    const state = h.manager.getTruckState('TRK-TEST');
+    expect(state?.activeDelay).toBe('TRAFFIC');
+    expect(state?.status).toBe('DELAYED');
+    expect(state?.speedKmph).toBeCloseTo(60 * 0.45, 6);
+
+    // 5 x 10 minutes at 27 km/h over a 100 km route == 22.5 km == +22.5%.
+    expect((state?.progress ?? 0) - start).toBeCloseTo(22.5, 3);
+
+    await h.manager.stop();
+  });
+
+  it('calculates ETA from the authoritative remaining distance and speed', async () => {
+    const h = await movingHarness();
+    await h.manager.applyDelay('TRK-TEST', 'RAIN');
+
+    const state = h.manager.getTruckState('TRK-TEST');
+    if (!state?.eta) throw new Error('expected an ETA');
+
+    // Recompute independently from the engine's own state — no countdown, no
+    // stored guess: distance still to drive over the effective speed.
+    const profile = buildRouteProfile(ROUTE);
+    const expected = calculateEta({
+      remainingKm: remainingKm(profile, state.progress),
+      speedKmph: state.speedKmph,
+      now: state.lastUpdatedAt,
+      speedMultiplier: 1,
+    });
+
+    expect(state.eta.getTime()).toBe(expected?.getTime());
+
+    // And the emitted payload says the same thing as the state.
+    expect(h.sink.ofType('TRUCK_ETA_UPDATED').at(-1)?.data.eta).toBe(state.eta.toISOString());
+
+    await h.manager.stop();
+  });
+
+  it('recovers the base speed of a truck loaded mid-delay', async () => {
+    // The seeded RAIN truck: 39 km/h is already 60 x 0.65, so the base divides
+    // straight back out and a restart restores the demo exactly.
+    const h = harness([truckRow({ activeDelay: 'RAIN', status: 'DELAYED', speedKmph: 39 })]);
+    await h.manager.start();
+
+    expect(h.manager.getTruckState('TRK-TEST')?.baseSpeedKmph).toBeCloseTo(60, 6);
+
+    const { truck } = await h.manager.clearDelay('TRK-TEST');
+    expect(truck.speedKmph).toBeCloseTo(60, 6);
+    expect(truck.status).toBe('IN_TRANSIT');
+
+    await h.manager.stop();
+  });
+
+  it('keeps a delayed truck DELAYED past the ARRIVING threshold', async () => {
+    // Started close to the yard, and stepped in small increments so the truck
+    // lands inside the ARRIVING band instead of jumping the whole way to ARRIVED.
+    const h = harness([truckRow({ progress: 90 })]);
+    await h.manager.start();
+    await h.manager.applyDelay('TRK-TEST', 'RAIN');
+
+    // Walk past 95% while still delayed.
+    for (let i = 0; i < 40; i += 1) {
+      await h.advance(ONE_HOUR / 60);
+      if ((h.manager.getTruckState('TRK-TEST')?.progress ?? 0) >= 96) break;
+    }
+
+    const delayed = h.manager.getTruckState('TRK-TEST');
+    expect(delayed?.progress).toBeGreaterThanOrEqual(95);
+    expect(delayed?.status).toBe('DELAYED');
+
+    // Clearing hands it straight to ARRIVING rather than back to IN_TRANSIT.
+    const { truck } = await h.manager.clearDelay('TRK-TEST');
+    expect(truck.status).toBe('ARRIVING');
+
+    await h.manager.stop();
+  });
+
+  it('is idempotent — the same scenario twice raises one alert', async () => {
+    const h = await movingHarness();
+    await h.manager.applyDelay('TRK-TEST', 'RAIN');
+    const second = await h.manager.applyDelay('TRK-TEST', 'RAIN');
+
+    expect(second.alert).toBeNull();
+    expect(h.store.alerts).toHaveLength(1);
+    expect(h.sink.ofType('TRUCK_STATUS_CHANGED').filter((e) => e.data.status === 'DELAYED'))
+      .toHaveLength(1);
+
+    await h.manager.stop();
+  });
+
+  it('refuses to delay a truck that is not being simulated', async () => {
+    const h = await movingHarness();
+
+    await expect(h.manager.applyDelay('TRK-NOPE', 'RAIN')).rejects.toThrow(
+      'Truck TRK-NOPE is not being simulated',
+    );
+
+    await h.manager.stop();
+  });
+
+  it('refuses to delay a truck that has already arrived', async () => {
+    const h = harness([truckRow({ progress: 99.9 })]);
+    await h.manager.start();
+    await h.advance(ONE_HOUR);
+
+    expect(h.manager.getTruckState('TRK-TEST')?.status).toBe('ARRIVED');
+
+    await expect(h.manager.applyDelay('TRK-TEST', 'RAIN')).rejects.toMatchObject({
+      status: 409,
+    });
+
+    await h.manager.stop();
+  });
+
+  it('applies the delay even when the alert write fails', async () => {
+    const h = await movingHarness();
+    h.store.failAlerts = true;
+
+    const { truck, alert } = await h.manager.applyDelay('TRK-TEST', 'TRAFFIC');
+
+    // Losing the audit row must not fail the command or leave the engine half
+    // changed — the truck is authoritatively delayed either way.
+    expect(alert).toBeNull();
+    expect(truck.activeDelay).toBe('TRAFFIC');
+    expect(truck.speedKmph).toBeCloseTo(60 * 0.45, 6);
+
+    await h.manager.stop();
+  });
+
+  it('holds the tick lock across its own writes', async () => {
+    const h = await movingHarness();
+    let release = (): void => {};
+    h.store.alertGate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+
+    // Leave the command parked inside the alert write, with the new state
+    // already in the live map and `persist()` still ahead of it.
+    const command = h.manager.applyDelay('TRK-TEST', 'RAIN');
+    await Promise.resolve();
+    const parked = h.manager.getTruckState('TRK-TEST');
+    expect(parked?.activeDelay).toBe('RAIN');
+
+    // A tick firing now must be skipped. Without the lock it would advance the
+    // truck, and the command's persist() would then write the pre-tick snapshot
+    // back over it — rolling the position back and regressing the sequence.
+    await h.advance(ONE_HOUR / 60);
+    expect(h.manager.getTruckState('TRK-TEST')?.progress).toBe(parked?.progress);
+
+    release();
+    const { truck } = await command;
+
+    const settled = h.manager.getTruckState('TRK-TEST');
+    expect(settled?.progress).toBe(parked?.progress);
+    expect(settled?.sequenceNumber).toBe(truck.sequenceNumber);
+
+    // The loop picks up again afterwards, covering the elapsed time it missed.
+    await h.advance(ONE_HOUR / 60);
+    const moved = h.manager.getTruckState('TRK-TEST');
+    expect(moved?.progress ?? 0).toBeGreaterThan(parked?.progress ?? 0);
+    expect(moved?.sequenceNumber ?? 0).toBeGreaterThan(truck.sequenceNumber);
+
+    await h.manager.stop();
+  });
+
+  it('announces a switch from one scenario to another', async () => {
+    const h = await movingHarness();
+    await h.manager.applyDelay('TRK-TEST', 'RAIN');
+    const before = h.sink.ofType('TRUCK_STATUS_CHANGED').length;
+
+    await h.manager.applyDelay('TRK-TEST', 'TRAFFIC');
+
+    // The status is DELAYED either way, but TRUCK_STATUS_CHANGED is the only
+    // payload carrying activeDelay — a subscriber that never sees it keeps
+    // rendering "Rain".
+    const emitted = h.sink.ofType('TRUCK_STATUS_CHANGED').slice(before);
+    expect(emitted).toHaveLength(1);
+    expect(emitted[0]?.data).toMatchObject({
+      previousStatus: 'DELAYED',
+      status: 'DELAYED',
+      activeDelay: 'TRAFFIC',
+    });
+
+    await h.manager.stop();
+  });
+
+  it('clears the scenario when a delayed truck arrives', async () => {
+    const h = harness([truckRow({ progress: 99 })]);
+    await h.manager.start();
+    await h.manager.applyDelay('TRK-TEST', 'RAIN');
+
+    await h.advance(ONE_HOUR);
+
+    // An ARRIVED truck has no speed for a multiplier to act on, and changeDelay
+    // refuses it — so a scenario left set here could never be cleared.
+    const state = h.manager.getTruckState('TRK-TEST');
+    expect(state?.status).toBe('ARRIVED');
+    expect(state?.activeDelay).toBe('NORMAL');
+
+    await h.manager.stop();
+  });
+
+  it('refuses a delay while the loop is stopped', async () => {
+    const h = await movingHarness();
+    await h.manager.stop();
+
+    // stop() keeps the world loaded, so the live lookup alone would let this
+    // through and write a business event for a truck that is standing still.
+    expect(h.manager.getTruckState('TRK-TEST')).toBeDefined();
+
+    await expect(h.manager.applyDelay('TRK-TEST', 'RAIN')).rejects.toMatchObject({
+      status: 409,
+    });
+    expect(h.store.alerts).toHaveLength(0);
   });
 });

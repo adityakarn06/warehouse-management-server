@@ -5,6 +5,8 @@ import { io as createClient } from 'socket.io-client';
 import type { Socket as ClientSocket } from 'socket.io-client';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import type { LocationSnapshotReason } from '../src/generated/prisma/enums.js';
+import type { AlertRecord, CreateAlertInput } from '../src/services/alert-service.js';
+import { delayMultipliersFromEnv } from '../src/simulation/delay-scenarios.js';
 import type { LiveTruckState } from '../src/simulation/live-state.js';
 import { clearRouteProfileCache } from '../src/simulation/route-engine.js';
 import { SimulationManager } from '../src/simulation/simulation-manager.js';
@@ -71,6 +73,7 @@ function truckView(overrides: Partial<LiveTruckWireView> = {}): LiveTruckWireVie
     reference: 'TRK-A',
     routeId: 'RTE-1',
     shipmentId: 'SHP-A',
+    baseSpeedKmph: 60,
     latitude: 20,
     longitude: 80,
     progress: 10,
@@ -148,7 +151,9 @@ describe('realtime room routing', () => {
           shipmentId: 'SHP-A',
           previousStatus: 'IN_TRANSIT',
           status: 'ARRIVING',
+          activeDelay: 'NORMAL',
           progress: 96,
+          speedKmph: 60,
           eta: null,
           serverTimestamp: '2026-08-26T18:16:00.000Z',
           sequenceNumber: 3,
@@ -253,6 +258,29 @@ function truckRow(overrides: Partial<SimulationTruckRow> = {}): SimulationTruckR
   };
 }
 
+/**
+ * `createAlert` returns a Prisma row; the fakes only need something shaped like
+ * one. Ids are sequential so a test can assert two distinct alerts.
+ */
+let alertSeq = 0;
+function fakeAlertRecord(input: CreateAlertInput): AlertRecord {
+  alertSeq += 1;
+  return {
+    id: `ALERT-${alertSeq}`,
+    type: input.type,
+    severity: input.severity,
+    title: input.title,
+    message: input.message,
+    truckId: input.truckId ?? null,
+    shipmentId: input.shipmentId ?? null,
+    dockDoorId: input.dockDoorId ?? null,
+    metadata: (input.metadata ?? null) as AlertRecord['metadata'],
+    acknowledged: false,
+    acknowledgedAt: null,
+    createdAt: new Date('2026-08-26T18:16:00.000Z'),
+  };
+}
+
 class NoopStore implements SimulationStore {
   constructor(private readonly rows: SimulationTruckRow[]) {}
 
@@ -262,6 +290,10 @@ class NoopStore implements SimulationStore {
 
   async persist(_state: LiveTruckState, _reason: LocationSnapshotReason | null): Promise<void> {
     // The realtime tests do not care where rows land.
+  }
+
+  async createAlert(input: CreateAlertInput): Promise<AlertRecord> {
+    return fakeAlertRecord(input);
   }
 }
 
@@ -283,6 +315,7 @@ describe('simulation -> realtime sink', () => {
       speedMultiplier: 1,
       arrivingProgress: 95,
       checkpointStep: 5,
+  delayMultipliers: delayMultipliersFromEnv,
     });
 
     await manager.start();
@@ -313,6 +346,7 @@ describe('simulation -> realtime sink', () => {
       speedMultiplier: 1,
       arrivingProgress: 95,
       checkpointStep: 5,
+  delayMultipliers: delayMultipliersFromEnv,
     });
 
     await manager.start();
@@ -338,6 +372,7 @@ describe('simulation -> realtime sink', () => {
       speedMultiplier: 1,
       arrivingProgress: 95,
       checkpointStep: 5,
+  delayMultipliers: delayMultipliersFromEnv,
     });
 
     await manager.start();

@@ -62,7 +62,7 @@ config via `import { env } from './config/index.js'`, never `process.env`
 
 ## Current state
 
-**Phases 1–5 are done.**
+**Phases 1–6 are done.**
 
 Phase 1 (foundation): config, logger, Prisma client, error handling,
 `/health` + `/api/v1/health` + `/api/v1/health/db`, bare Socket.IO server.
@@ -144,17 +144,32 @@ Clients subscribe explicitly (`subscribe:operations`, `subscribe:truck`,
 `subscribe:shipment`) and get their opening state in the Socket.IO **ack**;
 nothing is broadcast to a socket that did not ask. Events go out **by name**
 (`socket.on('TRUCK_POSITION_UPDATED', ...)`), not in a `{ type, data }` envelope.
-`ALERT_CREATED`, `DOCK_STATUS_CHANGED`, `DOCK_ASSIGNED` and `DOCK_REASSIGNED` are
-defined and routed but nothing emits them until Phases 7–8.
+`DOCK_STATUS_CHANGED`, `DOCK_ASSIGNED` and `DOCK_REASSIGNED` are defined and
+routed but nothing emits them until Phases 7–8. `ALERT_CREATED` went live in
+Phase 6.
 
 Full reference with example payloads: `api-docs/api.md`, and
 `api-docs/realtime.md` for the Socket.IO contract.
 
+Phase 6 (ETA + delay scenarios): the operator can now slow a truck down.
+
+```text
+src/simulation/delay-scenarios.ts  the multiplier table, severities and labels
+```
+
+`POST /api/v1/simulation/trucks/:truckId/delay` (body `{ "type": "RAIN" }`) and
+`POST .../clear-delay`. The frontend sends a scenario name and nothing else;
+`SimulationManager.applyDelay` / `clearDelay` own every consequence — effective
+speed, recalculated ETA, `DELAYED` status, one persisted `TRUCK_DELAYED` alert,
+and `TRUCK_ETA_UPDATED` + `TRUCK_STATUS_CHANGED` + `ALERT_CREATED`. Both return
+the authoritative resulting state. New env vars: `DELAY_MULTIPLIER_RAIN` (0.65),
+`DELAY_MULTIPLIER_TRAFFIC` (0.45), `DELAY_MULTIPLIER_ROAD_CLOSURE` (0.10).
+`createAlert` in `src/services/alert-service.ts` is the project's first alert
+writer, and Phase 8's dock alerts reuse it unchanged.
+
 Still empty placeholder directories: `src/docking`, `src/alerts` and `src/wms`.
-Delay scenarios (§7) are Phase 6 and are **not** implemented — the engine simply
-uses each truck's stored `speedKmph`, which is why the seeded DELAYED trucks
-already crawl. Sections 7–11, 15, 24–25 and 27–31 below describe the target
-system, not the code on disk.
+Sections 8–11, 15, 24–25 and 27–31 below describe the target system, not the code
+on disk.
 
 ## Conventions that are easy to get wrong
 
@@ -245,6 +260,34 @@ system, not the code on disk.
   400, so `subscribe:*` validates with `safeParse` and replies
   `{ ok: false, error }`. The ack is also optional on the wire — check it is a
   function before calling it.
+- **Effective speed is base speed x the delay multiplier, and there is no base
+  speed column.** `LiveTruckState.speedKmph` is the *effective* speed everywhere —
+  in `advanceTruck`, in `persist`, in every payload. `baseSpeedKmph` is derived
+  once at load time by dividing the persisted speed by the multiplier for the
+  persisted `activeDelay`, which is exactly how the seed is built (the RAIN truck
+  is 39 = 60 x 0.65, the TRAFFIC truck 27 = 60 x 0.45). Two consequences: every
+  multiplier must be **greater than zero** (hence ROAD_CLOSURE is 0.10, not 0 —
+  and a zero-speed truck would also stop emitting, since `advanceTruck` treats
+  "covered no ground" as nothing to report), and changing a multiplier constant
+  reinterprets already-persisted rows.
+- **A delayed truck is never promoted to `ARRIVING`.** The status ladder in
+  `advanceTruck` skips the promotion while `activeDelay !== 'NORMAL'`, so the
+  operator's scenario is not silently overwritten at 95%. `clearDelay` recomputes
+  the status from progress instead. `ARRIVED` still wins at 100%.
+- **Delay commands await the in-flight tick, then mutate synchronously.** A tick
+  reads a truck, awaits its write, then writes the result back into the live map,
+  so mutating underneath one would be undone. `changeDelay` awaits `inFlight`
+  first and does everything up to `live.set()` without an `await`, which closes
+  the window without a second lock. It also bumps `sequenceNumber` past the
+  high-water mark so clients do not drop the update.
+- **A delay is a business event; a position is not.** One button press writes one
+  `Truck` update, one `LocationHistory` row (`DELAY_ACTIVATED`/`DELAY_CLEARED`)
+  and one `Alert`. Pressing the same button twice is a no-op success, and a failed
+  alert write is logged but never fails the command — the truck is authoritatively
+  delayed either way.
+- **The engine still never emits Socket.IO itself.** `createAlert` in
+  `alert-service.ts` only writes; the manager emits `ALERT_CREATED` through its
+  `SimulationEventSink` like every other event (§14).
 - **ETA holds steady under constant speed — that is correct.** `calculateEta`
   returns an absolute wall-clock instant, so what counts down is the time
   remaining, not the timestamp. An arrival time that drifts while the truck keeps

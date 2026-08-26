@@ -1,11 +1,7 @@
-import type {
-  AlertSeverity,
-  AlertType,
-  AssignmentStatus,
-  DockStatus,
-} from '../generated/prisma/enums.js';
+import type { AssignmentStatus, DockStatus } from '../generated/prisma/enums.js';
 import type { LiveTruckView } from '../simulation/live-state.js';
 import type {
+  AlertCreatedPayload,
   TruckEtaPayload,
   TruckPositionPayload,
   TruckStatusPayload,
@@ -23,23 +19,16 @@ import type {
  * never route geometry.
  */
 
-// The three truck payloads are already defined by the engine and already carry
-// truckId / reference / shipmentId — exactly what room routing needs. Re-export
-// rather than redefine, so the two contracts cannot drift.
-export type { TruckEtaPayload, TruckPositionPayload, TruckStatusPayload };
-
-/** Emitted from Phase 8 onwards, when the alert engine lands. */
-export interface AlertCreatedPayload {
-  alertId: string;
-  type: AlertType;
-  severity: AlertSeverity;
-  title: string;
-  message: string;
-  truckId: string | null;
-  shipmentId: string | null;
-  dockDoorId: string | null;
-  createdAt: string;
-}
+// These payloads are already defined by the engine and already carry the ids
+// room routing needs. Re-export rather than redefine, so the two contracts
+// cannot drift. `AlertCreatedPayload` joined them in Phase 6, when the delay
+// commands became the first thing to raise an alert.
+export type {
+  AlertCreatedPayload,
+  TruckEtaPayload,
+  TruckPositionPayload,
+  TruckStatusPayload,
+};
 
 /** Emitted from Phase 8 onwards (`PATCH /docks/:id/status`). */
 export interface DockStatusChangedPayload {

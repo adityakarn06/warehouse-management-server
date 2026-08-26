@@ -22,7 +22,14 @@ export interface LiveTruckState {
 
   /** 0-100 along the route. */
   progress: number;
+  /** Effective ground speed — the base speed after the active delay multiplier. */
   speedKmph: number;
+  /**
+   * The truck's undelayed speed. There is no column for it: it is recovered at
+   * load time from the persisted `speedKmph` and `activeDelay`, and it is what
+   * clearing a delay restores. See `delay-scenarios.ts`.
+   */
+  baseSpeedKmph: number;
   eta: Date | null;
 
   status: TruckStatus;

@@ -1,3 +1,7 @@
+import {
+  baseSpeedKmphFrom,
+  delayMultipliersFromEnv,
+} from '../simulation/delay-scenarios.js';
 import type { LiveTruckState, LiveTruckView } from '../simulation/live-state.js';
 import { toLiveTruckView } from '../simulation/live-state.js';
 import { simulationManager } from '../simulation/simulation-manager.js';
@@ -83,6 +87,9 @@ function rowToWireView(row: TruckLiveRow): LiveTruckWireView {
     longitude: row.currentLongitude,
     progress: row.progress,
     speedKmph: row.speedKmph,
+    // Derived the same way the engine derives it at load time, so a truck
+    // answered from the database reports the same base speed as a live one.
+    baseSpeedKmph: baseSpeedKmphFrom(row.speedKmph, row.activeDelay, delayMultipliersFromEnv),
     eta: row.eta,
     status: row.status,
     activeDelay: row.activeDelay,

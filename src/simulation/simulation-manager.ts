@@ -1,11 +1,27 @@
 import { env } from '../config/index.js';
-import type { LocationSnapshotReason } from '../generated/prisma/enums.js';
+import { calculateEta } from '../eta/eta-engine.js';
+import type { DelayScenario, LocationSnapshotReason } from '../generated/prisma/enums.js';
+import { HttpError } from '../lib/http-error.js';
 import { logger } from '../lib/logger.js';
-import type { LiveTruckState } from './live-state.js';
-import { LiveStateStore } from './live-state.js';
+import type { ActiveDelayScenario, DelayMultipliers } from './delay-scenarios.js';
+import {
+  DELAY_LABEL,
+  DELAY_SEVERITY,
+  baseSpeedKmphFrom,
+  delayMultipliersFromEnv,
+  effectiveSpeedKmph,
+  multiplierFor,
+} from './delay-scenarios.js';
+import type { LiveTruckState, LiveTruckView } from './live-state.js';
+import { LiveStateStore, isMoving, toLiveTruckView } from './live-state.js';
 import type { RouteProfile } from './route-engine.js';
-import { buildRouteProfile, clearRouteProfileCache, pointAtProgress } from './route-engine.js';
-import type { SimulationEventSink } from './simulation-events.js';
+import {
+  buildRouteProfile,
+  clearRouteProfileCache,
+  pointAtProgress,
+  remainingKm,
+} from './route-engine.js';
+import type { AlertCreatedPayload, SimulationEventSink } from './simulation-events.js';
 import { loggerEventSink } from './simulation-events.js';
 import type { SimulationStore, SimulationTruckRow } from './simulation-store.js';
 import { prismaSimulationStore } from './simulation-store.js';
@@ -29,6 +45,18 @@ export interface SimulationManagerDeps {
   arrivingProgress: number;
   /** Progress % between periodic database checkpoints. */
   checkpointStep: number;
+  /** Speed multiplier per delay scenario (CLAUDE.md §7). */
+  delayMultipliers: DelayMultipliers;
+}
+
+/**
+ * What a delay command answers with: the authoritative resulting state, so the
+ * frontend never has to guess or re-read (CLAUDE.md §2).
+ */
+export interface DelayResult {
+  truck: LiveTruckView;
+  /** The alert the activation raised. Clearing a delay raises none. */
+  alert: AlertCreatedPayload | null;
 }
 
 interface TrackedTruck {
@@ -97,6 +125,10 @@ export class SimulationManager {
 
   get tickMs(): number {
     return this.deps.tickMs;
+  }
+
+  get delayMultipliers(): DelayMultipliers {
+    return this.deps.delayMultipliers;
   }
 
   /** Runs `op` after every lifecycle operation already queued. */
@@ -238,6 +270,213 @@ export class SimulationManager {
     }
   }
 
+  // --- Delay scenarios (CLAUDE.md §7) --------------------------------------
+
+  /**
+   * Activate a delay scenario on one truck. The frontend sends only the scenario
+   * name; every consequence — effective speed, ETA, status, the alert, the
+   * realtime events, the persisted business event — is decided here (§2).
+   */
+  async applyDelay(idOrReference: string, scenario: ActiveDelayScenario): Promise<DelayResult> {
+    return this.changeDelay(idOrReference, scenario);
+  }
+
+  /** Clear the active scenario and restore the truck's base speed. */
+  async clearDelay(idOrReference: string): Promise<DelayResult> {
+    return this.changeDelay(idOrReference, 'NORMAL');
+  }
+
+  /**
+   * A delay command occupies the same slot a tick does. Waiting for an in-flight
+   * tick is not enough on its own: the command keeps awaiting (the alert write,
+   * then `persist`) *after* it has written the new state, and a tick firing in
+   * that window would advance the truck only for `persist` to write the
+   * pre-command snapshot back over it — rolling the position back and regressing
+   * `sequenceNumber` below the high-water mark, which makes dashboards drop the
+   * next update. Taking `inFlight` for the whole command closes that window, and
+   * makes two rapid commands queue instead of clobbering each other.
+   */
+  private async changeDelay(
+    idOrReference: string,
+    scenario: DelayScenario,
+  ): Promise<DelayResult> {
+    // A loop: after awaiting, another caller may have taken the slot. The claim
+    // below is safe because nothing awaits between the check and the assignment.
+    while (this.inFlight !== null) {
+      await this.inFlight;
+    }
+
+    const run = this.runChangeDelay(idOrReference, scenario);
+    // `inFlight` is a barrier that tick() and stop() await — it must never
+    // reject, or a rejected command would surface as an unhandled failure there.
+    this.inFlight = run.then(
+      () => undefined,
+      () => undefined,
+    );
+
+    try {
+      return await run;
+    } finally {
+      this.inFlight = null;
+    }
+  }
+
+  private async runChangeDelay(
+    idOrReference: string,
+    scenario: DelayScenario,
+  ): Promise<DelayResult> {
+    // A stopped loop is not advancing anyone: applying a scenario would write a
+    // business event and an alert for a truck standing still, and hand back an
+    // ETA computed at the stopped instant that goes stale the moment the loop
+    // restarts and rebases its clock.
+    if (this.timer === null) {
+      throw HttpError.conflict('Simulation is not running');
+    }
+
+    const state = this.live.get(idOrReference);
+    if (!state) {
+      throw HttpError.notFound(`Truck ${idOrReference} is not being simulated`);
+    }
+
+    // ARRIVED / DOCKED / COMPLETED trucks are not on the road any more, so there
+    // is no speed for a scenario to act on.
+    if (!isMoving(state.status)) {
+      throw HttpError.conflict(
+        `Truck ${state.reference} is ${state.status} and cannot change delay scenario`,
+      );
+    }
+
+    // Pressing the same button twice is a no-op, not a second alert.
+    if (state.activeDelay === scenario) {
+      return { truck: toLiveTruckView(state), alert: null };
+    }
+
+    const profile = this.profiles.get(state.truckId);
+    if (!profile) {
+      throw HttpError.internal(`No route profile loaded for ${state.reference}`);
+    }
+
+    const now = new Date(this.deps.now());
+    const speedKmph = effectiveSpeedKmph(
+      state.baseSpeedKmph,
+      scenario,
+      this.deps.delayMultipliers,
+    );
+
+    // The same authoritative call the tick makes: distance still to drive over
+    // the new effective speed. Never a hardcoded countdown (§6).
+    const eta = calculateEta({
+      remainingKm: remainingKm(profile, state.progress),
+      speedKmph,
+      now,
+      speedMultiplier: this.deps.speedMultiplier,
+    });
+
+    const status =
+      scenario === 'NORMAL'
+        ? // Restore the status the ladder would have reached on its own.
+          state.progress >= this.deps.arrivingProgress
+          ? 'ARRIVING'
+          : 'IN_TRANSIT'
+        : 'DELAYED';
+
+    const next: LiveTruckState = {
+      ...state,
+      speedKmph,
+      eta,
+      status,
+      activeDelay: scenario,
+      lastUpdatedAt: now,
+      // Bump past the high-water mark rather than the state's own counter, so a
+      // dashboard that drops out-of-order updates still applies this one.
+      sequenceNumber: (this.lastSequence.get(state.truckId) ?? state.sequenceNumber) + 1,
+      dirty: true,
+    };
+
+    this.live.set(next);
+    this.lastSequence.set(next.truckId, next.sequenceNumber);
+
+    this.emitEta(next);
+    // Also on a scenario switch that leaves the status alone (RAIN -> TRAFFIC
+    // is DELAYED either way): `TRUCK_STATUS_CHANGED` is the only payload
+    // carrying `activeDelay`, so without this every dashboard except the one
+    // that sent the command keeps rendering the old scenario forever.
+    if (next.status !== state.status || next.activeDelay !== state.activeDelay) {
+      this.emitStatus(next, state.status);
+    }
+
+    const alert =
+      scenario === 'NORMAL' ? null : await this.raiseDelayAlert(next, state, scenario);
+
+    await this.persist(next, scenario === 'NORMAL' ? 'DELAY_CLEARED' : 'DELAY_ACTIVATED');
+
+    logger.info(
+      `${next.reference}: delay ${state.activeDelay} -> ${scenario} ` +
+        `(${state.speedKmph} -> ${speedKmph} km/h)`,
+    );
+
+    // Re-read: persist() rewrites the entry with its checkpoint bookkeeping.
+    return { truck: toLiveTruckView(this.live.get(next.truckId) ?? next), alert };
+  }
+
+  /**
+   * A delay is a real operational event, so it gets a persisted alert (§11) —
+   * unlike a position update, which never touches the database.
+   */
+  private async raiseDelayAlert(
+    next: LiveTruckState,
+    previous: LiveTruckState,
+    scenario: ActiveDelayScenario,
+  ): Promise<AlertCreatedPayload | null> {
+    const label = DELAY_LABEL[scenario];
+    const etaShiftMinutes =
+      next.eta === null || previous.eta === null
+        ? null
+        : Math.round((next.eta.getTime() - previous.eta.getTime()) / 60_000);
+
+    try {
+      const alert = await this.deps.store.createAlert({
+        type: 'TRUCK_DELAYED',
+        severity: DELAY_SEVERITY[scenario],
+        title: `${label} delay on ${next.reference}`,
+        message:
+          `${next.reference} slowed from ${round(previous.speedKmph)} to ` +
+          `${round(next.speedKmph)} km/h due to ${label.toLowerCase()}` +
+          (etaShiftMinutes === null ? '.' : `; ETA pushed out by ${etaShiftMinutes} min.`),
+        truckId: next.truckId,
+        shipmentId: next.shipmentId,
+        metadata: {
+          delayType: scenario,
+          speedKmph: round(next.speedKmph),
+          previousSpeedKmph: round(previous.speedKmph),
+          baseSpeedKmph: round(next.baseSpeedKmph),
+          multiplier: multiplierFor(scenario, this.deps.delayMultipliers),
+          ...(etaShiftMinutes === null ? {} : { etaShiftMinutes }),
+        },
+      });
+
+      const payload: AlertCreatedPayload = {
+        alertId: alert.id,
+        type: alert.type,
+        severity: alert.severity,
+        title: alert.title,
+        message: alert.message,
+        truckId: alert.truckId,
+        shipmentId: alert.shipmentId,
+        dockDoorId: alert.dockDoorId,
+        createdAt: alert.createdAt.toISOString(),
+      };
+
+      this.deps.sink.emit({ type: 'ALERT_CREATED', data: payload });
+      return payload;
+    } catch (error) {
+      // The delay itself has already taken effect in memory. Losing the audit
+      // row must not fail the command or leave the engine half-changed.
+      logger.error(`Failed to raise delay alert for ${next.reference}`, error);
+      return null;
+    }
+  }
+
   // -------------------------------------------------------------------------
 
   private async load(): Promise<void> {
@@ -256,7 +495,12 @@ export class SimulationManager {
       try {
         loaded.push({
           // Resume this truck's counter rather than restarting it at 0.
-          state: toLiveState(row, loadedAt, this.lastSequence.get(row.id) ?? 0),
+          state: toLiveState(
+            row,
+            loadedAt,
+            this.lastSequence.get(row.id) ?? 0,
+            this.deps.delayMultipliers,
+          ),
           profile: buildRouteProfile(row.route),
         });
       } catch (error) {
@@ -422,7 +666,9 @@ export class SimulationManager {
         shipmentId: state.shipmentId,
         previousStatus,
         status: state.status,
+        activeDelay: state.activeDelay,
         progress: state.progress,
+        speedKmph: state.speedKmph,
         eta: state.eta?.toISOString() ?? null,
         serverTimestamp: state.lastUpdatedAt.toISOString(),
         sequenceNumber: state.sequenceNumber,
@@ -431,10 +677,14 @@ export class SimulationManager {
   }
 }
 
+/** Speeds are display values in alert copy — two decimals is plenty. */
+const round = (value: number): number => Math.round(value * 100) / 100;
+
 export function toLiveState(
   row: SimulationTruckRow,
   loadedAt: Date,
   sequenceNumber = 0,
+  delayMultipliers: DelayMultipliers = delayMultipliersFromEnv,
 ): LiveTruckState {
   return {
     truckId: row.id,
@@ -445,6 +695,9 @@ export function toLiveState(
     longitude: row.currentLongitude,
     progress: row.progress,
     speedKmph: row.speedKmph,
+    // No column for this: the stored speed is already the effective one, so the
+    // scenario that produced it is what divides back out to the base.
+    baseSpeedKmph: baseSpeedKmphFrom(row.speedKmph, row.activeDelay, delayMultipliers),
     eta: row.eta,
     status: row.status,
     activeDelay: row.activeDelay,
@@ -465,4 +718,5 @@ export const simulationManager = new SimulationManager({
   speedMultiplier: env.SIMULATION_SPEED_MULTIPLIER,
   arrivingProgress: env.SIMULATION_ARRIVING_PROGRESS,
   checkpointStep: env.SIMULATION_CHECKPOINT_PROGRESS_STEP,
+  delayMultipliers: delayMultipliersFromEnv,
 });

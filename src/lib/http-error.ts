@@ -19,6 +19,11 @@ export class HttpError extends Error {
     return new HttpError(404, message, details);
   }
 
+  /** The requested change conflicts with the resource's current state. */
+  static conflict(message = 'Conflict', details?: unknown): HttpError {
+    return new HttpError(409, message, details);
+  }
+
   static internal(message = 'Internal Server Error', details?: unknown): HttpError {
     return new HttpError(500, message, details);
   }

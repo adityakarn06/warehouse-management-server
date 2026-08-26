@@ -5,6 +5,8 @@ import type {
   TruckStatus,
 } from '../generated/prisma/enums.js';
 import { prisma } from '../lib/prisma.js';
+import type { AlertRecord, CreateAlertInput } from '../services/alert-service.js';
+import { createAlert } from '../services/alert-service.js';
 import type { LiveTruckState } from './live-state.js';
 import { MOVING_STATUSES } from './live-state.js';
 import type { RouteInput } from './route-engine.js';
@@ -37,6 +39,13 @@ export interface SimulationStore {
    * snapshot without a LocationHistory row.
    */
   persist(state: LiveTruckState, reason: LocationSnapshotReason | null): Promise<void>;
+  /**
+   * Write one alert. On this interface rather than reached for directly so the
+   * engine keeps a single injected database seam — the tests' fake store records
+   * alerts the same way it records snapshots. The business logic itself lives in
+   * `alert-service.ts` (§18); this only delegates.
+   */
+  createAlert(input: CreateAlertInput): Promise<AlertRecord>;
 }
 
 /**
@@ -51,6 +60,29 @@ const SHIPMENT_STATUS_FOR: Partial<Record<LocationSnapshotReason, ShipmentStatus
   ARRIVING: 'ARRIVING',
   ARRIVED: 'ARRIVED',
 };
+
+/**
+ * The delay reasons are the exception to the rule above: `DELAY_CLEARED` can
+ * leave the truck either IN_TRANSIT or ARRIVING, so the reason alone does not
+ * determine the shipment status. For those two the truck's *resulting* status is
+ * mirrored instead — the three moving statuses map 1:1 onto ShipmentStatus.
+ */
+const DELAY_REASONS: LocationSnapshotReason[] = ['DELAY_ACTIVATED', 'DELAY_CLEARED'];
+
+const SHIPMENT_STATUS_FOR_TRUCK: Partial<Record<TruckStatus, ShipmentStatus>> = {
+  IN_TRANSIT: 'IN_TRANSIT',
+  DELAYED: 'DELAYED',
+  ARRIVING: 'ARRIVING',
+};
+
+function shipmentStatusFor(
+  reason: LocationSnapshotReason | null,
+  truckStatus: TruckStatus,
+): ShipmentStatus | undefined {
+  if (reason === null) return undefined;
+  if (DELAY_REASONS.includes(reason)) return SHIPMENT_STATUS_FOR_TRUCK[truckStatus];
+  return SHIPMENT_STATUS_FOR[reason];
+}
 
 export const prismaSimulationStore: SimulationStore = {
   async loadTrucks() {
@@ -86,7 +118,7 @@ export const prismaSimulationStore: SimulationStore = {
   },
 
   async persist(state, reason) {
-    const shipmentStatus = reason === null ? undefined : SHIPMENT_STATUS_FOR[reason];
+    const shipmentStatus = shipmentStatusFor(reason, state.status);
 
     // One transaction so the truck snapshot, its history row and the mirrored
     // shipment status can never disagree (§18).
@@ -100,6 +132,7 @@ export const prismaSimulationStore: SimulationStore = {
           speedKmph: state.speedKmph,
           eta: state.eta,
           status: state.status,
+          activeDelay: state.activeDelay,
           arrivedAt: state.arrivedAt,
           lastUpdatedAt: state.lastUpdatedAt,
         },
@@ -128,5 +161,9 @@ export const prismaSimulationStore: SimulationStore = {
         });
       }
     });
+  },
+
+  async createAlert(input) {
+    return createAlert(input);
   },
 };

@@ -82,7 +82,14 @@ export function advanceTruck(input: AdvanceInput): AdvanceResult {
   let status = state.status;
   if (arrived) {
     status = 'ARRIVED';
-  } else if (progress >= arrivingProgress && status !== 'ARRIVING') {
+  } else if (
+    progress >= arrivingProgress &&
+    status !== 'ARRIVING' &&
+    // A delayed truck stays DELAYED all the way to ARRIVED. Without this guard
+    // the ladder would silently overwrite the operator's scenario the moment the
+    // truck crossed 95%, and clearing the delay would have nothing to restore.
+    state.activeDelay === 'NORMAL'
+  ) {
     status = 'ARRIVING';
   }
 
@@ -96,6 +103,12 @@ export function advanceTruck(input: AdvanceInput): AdvanceResult {
     speedKmph,
     eta,
     status,
+    // Arriving ends the scenario: the truck is off the road, so there is no
+    // speed left for a multiplier to act on. Leaving it set would strand the
+    // row as ARRIVED-and-delayed — `changeDelay` refuses a truck that is not
+    // moving, so nothing could ever clear it, and it would keep showing up
+    // under `GET /api/v1/trucks?activeDelay=true`.
+    activeDelay: arrived ? 'NORMAL' : state.activeDelay,
     arrivedAt: arrived ? (state.arrivedAt ?? now) : state.arrivedAt,
     lastUpdatedAt: now,
     sequenceNumber: state.sequenceNumber + 1,

@@ -210,7 +210,7 @@ so every section describes the same moment.
 
 ---
 
-## Simulation (Phase 4)
+## Simulation (Phases 4 & 6)
 
 The backend owns truck movement. It advances every moving truck once every
 `SIMULATION_TICK_MS` (2000 by default) along its fixed route, recomputes the
@@ -218,15 +218,15 @@ authoritative position, progress and ETA, and drives `IN_TRANSIT → ARRIVING �
 ARRIVED`. The loop starts on server boot unless `SIMULATION_AUTOSTART=false`
 (it is always off under `NODE_ENV=test`).
 
-Delay commands (`/delay`, `/clear-delay`) are Phase 6 and are not implemented yet.
-
 | Method | Path | Notes |
 | --- | --- | --- |
 | `POST` | `/api/v1/simulation/start` | Idempotent — a second call is ignored, never a second loop |
 | `POST` | `/api/v1/simulation/stop` | Stops the loop and flushes unpersisted movement |
 | `POST` | `/api/v1/simulation/reset` | Reload the world from the database, keeping the loop's running/stopped state. A full demo rewind is `pnpm db:seed` |
 | `GET` | `/api/v1/simulation/state` | Live state for every simulated truck |
-| `GET` | `/api/v1/simulation/trucks/:truckId` | One truck, by id or reference |
+| `GET` | `/api/v1/simulation/trucks/:truckId` | One truck, by id or reference — including its current scenario |
+| `POST` | `/api/v1/simulation/trucks/:truckId/delay` | Activate a delay scenario |
+| `POST` | `/api/v1/simulation/trucks/:truckId/clear-delay` | Return the truck to normal speed |
 
 The three lifecycle endpoints return the same shape:
 
@@ -249,9 +249,11 @@ The three lifecycle endpoints return the same shape:
     "previousLongitude": 85.31418,
     "progress": 62.18175,
     "speedKmph": 58,
+    "baseSpeedKmph": 58,
     "eta": "2026-08-27T00:58:11.954Z",
     "status": "IN_TRANSIT",
     "activeDelay": "NORMAL",
+    "delayMultiplier": 1,
     "arrivedAt": null,
     "lastUpdatedAt": "2026-08-26T15:15:22.401Z",
     "sequenceNumber": 10
@@ -262,10 +264,97 @@ The three lifecycle endpoints return the same shape:
 A truck that is not being simulated (terminal status, or the loop is not running)
 404s with the standard error envelope.
 
+### Delay scenarios (Phase 6)
+
+The frontend's **Rain / Traffic / Road Closure / Clear** buttons send a scenario
+name and nothing else. The backend owns every consequence (§2): effective speed,
+ETA, status, the alert and the realtime events.
+
+```text
+POST /api/v1/simulation/trucks/TRK-101/delay
+{ "type": "RAIN" }
+```
+
+`type` is one of `RAIN` `TRAFFIC` `ROAD_CLOSURE`. `NORMAL` is rejected — clearing
+is its own endpoint, so activating and clearing can never be confused.
+
+Effective speed is the truck's **base** speed times the scenario's multiplier:
+
+| Scenario | Multiplier | Env var | Alert severity |
+| --- | --- | --- | --- |
+| `NORMAL` | `1.00` | — | — |
+| `RAIN` | `0.65` | `DELAY_MULTIPLIER_RAIN` | `WARNING` |
+| `TRAFFIC` | `0.45` | `DELAY_MULTIPLIER_TRAFFIC` | `WARNING` |
+| `ROAD_CLOSURE` | `0.10` | `DELAY_MULTIPLIER_ROAD_CLOSURE` | `CRITICAL` |
+
+There is no `baseSpeedKmph` column. A persisted row carries the *effective* speed
+plus the scenario that produced it, so the base divides straight back out at load
+time — which is why every multiplier must be greater than zero. A road closure is
+therefore a very strong slowdown rather than a full stop (a stationary truck would
+stop emitting position updates entirely). The seed is built to match: the RAIN
+truck is 39 km/h (60 × 0.65) and the TRAFFIC truck is 27 km/h (60 × 0.45).
+
+Both endpoints return the authoritative resulting state, so the frontend never has
+to recompute or re-read anything:
+
+```json
+{
+  "data": {
+    "truck": {
+      "truckId": "TRK-101",
+      "reference": "TRK-101",
+      "progress": 66.69733,
+      "speedKmph": 37.7,
+      "baseSpeedKmph": 58,
+      "eta": "2026-08-27T05:35:28.817Z",
+      "status": "DELAYED",
+      "activeDelay": "RAIN",
+      "delayMultiplier": 0.65,
+      "sequenceNumber": 75
+    },
+    "alert": {
+      "alertId": "cmtab2cvw0000sditzaufjr0n",
+      "type": "TRUCK_DELAYED",
+      "severity": "WARNING",
+      "title": "Rain delay on TRK-101",
+      "message": "TRK-101 slowed from 58 to 37.7 km/h due to rain; ETA pushed out by 276 min.",
+      "truckId": "TRK-101",
+      "shipmentId": "SHP-1001",
+      "dockDoorId": null,
+      "createdAt": "2026-08-26T16:25:45.404Z"
+    }
+  }
+}
+```
+
+Notes on behaviour:
+
+- A delayed truck stays `DELAYED` all the way to `ARRIVED` — it is not promoted to
+  `ARRIVING` at 95%, so the operator's scenario is never silently overwritten.
+  Clearing recomputes the status from progress (`ARRIVING` past the threshold,
+  otherwise `IN_TRANSIT`).
+- **Clearing raises no alert** and returns `"alert": null`. §11 defines no
+  "delay cleared" type, and reusing `TRUCK_DELAYED` would be off-label.
+- Pressing the same button twice is a no-op success: one alert, not two.
+- One activation writes one `Truck` update, one `LocationHistory` row
+  (`DELAY_ACTIVATED` / `DELAY_CLEARED`) and one `Alert`. Position ticks still never
+  touch the database (§24).
+- Only one primary scenario is active per truck (§7). Switching between two
+  scenarios (RAIN -> TRAFFIC) leaves the status `DELAYED` but still emits
+  `TRUCK_STATUS_CHANGED`, because that is the only payload carrying `activeDelay`.
+- Arriving clears the scenario back to `NORMAL` — an `ARRIVED` truck has no speed
+  for a multiplier to act on, and could never be un-delayed afterwards.
+- `404` if the truck is not being simulated (unknown, terminal status, or the loop
+  never loaded it); `409` if it arrived while the loop was running, or if the
+  simulation is stopped; `400` for an unknown scenario name.
+- A delay command holds the same lock a tick does, so it can never interleave
+  with one; two rapid commands queue.
+
 ### Realtime events
 
-The engine emits `TRUCK_POSITION_UPDATED`, `TRUCK_ETA_UPDATED` and
-`TRUCK_STATUS_CHANGED` into a `SimulationEventSink` (§14). Phase 5 backs that sink
+The engine emits `TRUCK_POSITION_UPDATED`, `TRUCK_ETA_UPDATED`,
+`TRUCK_STATUS_CHANGED` and — since Phase 6 — `ALERT_CREATED` into a
+`SimulationEventSink` (§14). Phase 5 backs that sink
 with Socket.IO: events are broadcast by name to the `operations`, `truck:{id}` and
 `shipment:{id}` rooms, and clients join by emitting `subscribe:operations` /
 `subscribe:truck` / `subscribe:shipment`, each answering with a state snapshot.
@@ -299,4 +388,22 @@ curl -s http://localhost:4000/api/v1/simulation/trucks/TRK-101 | jq
 # Lifecycle
 curl -sX POST http://localhost:4000/api/v1/simulation/stop  | jq
 curl -sX POST http://localhost:4000/api/v1/simulation/start | jq
+
+# Scenario B — rain delay
+curl -sX POST http://localhost:4000/api/v1/simulation/trucks/TRK-101/delay \
+  -H 'Content-Type: application/json' -d '{"type":"RAIN"}' | jq
+
+# Scenario C — traffic delay (a stronger slowdown)
+curl -sX POST http://localhost:4000/api/v1/simulation/trucks/TRK-102/delay \
+  -H 'Content-Type: application/json' -d '{"type":"TRAFFIC"}' | jq
+
+# Road closure — the strongest slowdown, and a CRITICAL alert
+curl -sX POST http://localhost:4000/api/v1/simulation/trucks/TRK-104/delay \
+  -H 'Content-Type: application/json' -d '{"type":"ROAD_CLOSURE"}' | jq
+
+# Back to normal
+curl -sX POST http://localhost:4000/api/v1/simulation/trucks/TRK-101/clear-delay | jq
+
+# The alerts those delays raised
+curl -s 'http://localhost:4000/api/v1/alerts?type=TRUCK_DELAYED&limit=3' | jq
 ```

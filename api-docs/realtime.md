@@ -113,6 +113,7 @@ socket.emit('subscribe:shipment', { shipmentId: 'E2-TRACK-101' }, (res) => {
   "longitude": 84.06841,
   "progress": 62.0,
   "speedKmph": 58,
+  "baseSpeedKmph": 58,
   "eta": "2026-08-27T00:58:11.954Z",
   "status": "IN_TRANSIT",
   "activeDelay": "NORMAL",
@@ -121,6 +122,10 @@ socket.emit('subscribe:shipment', { shipmentId: 'E2-TRACK-101' }, (res) => {
   "sequenceNumber": 3
 }
 ```
+
+`speedKmph` is the truck's *effective* speed — `baseSpeedKmph` times the
+multiplier for `activeDelay`. Clearing a delay restores `speedKmph` to
+`baseSpeedKmph`.
 
 Every timestamp is an ISO string, not a `Date` — the server serialises them
 before they go into the ack. The same shape is served over REST by
@@ -146,13 +151,15 @@ socket.on('TRUCK_POSITION_UPDATED', (data) => { /* data is TruckPositionPayload 
 | `TRUCK_POSITION_UPDATED` | `operations`, `truck:{id}`, `shipment:{id}` | Phase 5 |
 | `TRUCK_ETA_UPDATED` | `operations`, `truck:{id}`, `shipment:{id}` | Phase 5 |
 | `TRUCK_STATUS_CHANGED` | `operations`, `truck:{id}`, `shipment:{id}` | Phase 5 |
-| `ALERT_CREATED` | `operations` + the truck/shipment it names | contract only — Phase 8 |
+| `ALERT_CREATED` | `operations` + the truck/shipment it names | Phase 6 |
 | `DOCK_STATUS_CHANGED` | `operations` | contract only — Phase 8 |
 | `DOCK_ASSIGNED` | `operations`, `truck:{id}`, `shipment:{id}` | contract only — Phase 7 |
 | `DOCK_REASSIGNED` | `operations`, `truck:{id}`, `shipment:{id}` | contract only — Phase 8 |
 
-The last four are fully defined and routed today; no code path emits them yet, so
+The last three are fully defined and routed today; no code path emits them yet, so
 a frontend can wire the handlers now and see them light up in later phases.
+`ALERT_CREATED` went live in Phase 6, when the delay commands became the first
+thing to raise an alert.
 
 Payloads carry ids and scalars only (§24) — never route geometry, never a full
 database record.
@@ -230,33 +237,48 @@ On a transition only, and it carries both sides of it.
 {
   "truckId": "TRK-101", "reference": "TRK-101", "shipmentId": "SHP-1001",
   "previousStatus": "IN_TRANSIT",
-  "status": "ARRIVING",
-  "progress": 95.02,
-  "eta": "2026-08-27T00:58:11.954Z",
-  "serverTimestamp": "2026-08-26T15:15:22.401Z",
-  "sequenceNumber": 42
+  "status": "DELAYED",
+  "activeDelay": "RAIN",
+  "progress": 66.7,
+  "speedKmph": 37.7,
+  "eta": "2026-08-27T05:35:28.817Z",
+  "serverTimestamp": "2026-08-26T16:25:45.399Z",
+  "sequenceNumber": 75
 }
 ```
 
-### `ALERT_CREATED` *(contract only — Phase 8)*
+`activeDelay` is the scenario in force *after* the change, so a dashboard can
+label the truck ("RAIN") from this event alone without re-reading it. A delayed
+truck stays `DELAYED` past the 95% `ARRIVING` threshold, right up to `ARRIVED`.
+
+### `ALERT_CREATED`
+
+Raised by backend domain logic when something operationally meaningful happens.
+Today that is a delay activation (Phase 6); Phases 7–8 add the dock cases.
 
 ```json
 {
-  "alertId": "clx...",
-  "type": "DOCK_REASSIGNMENT",
+  "alertId": "cmtab2cvw0000sditzaufjr0n",
+  "type": "TRUCK_DELAYED",
   "severity": "WARNING",
-  "title": "TRK-101 moved to D4",
-  "message": "D2 became unavailable; TRK-101 was reassigned to D4.",
+  "title": "Rain delay on TRK-101",
+  "message": "TRK-101 slowed from 58 to 37.7 km/h due to rain; ETA pushed out by 276 min.",
   "truckId": "TRK-101",
   "shipmentId": "SHP-1001",
-  "dockDoorId": "D4",
-  "createdAt": "2026-08-26T15:15:22.401Z"
+  "dockDoorId": null,
+  "createdAt": "2026-08-26T16:25:45.404Z"
 }
 ```
 
 `type` is one of `TRUCK_DELAYED`, `DOCK_UNAVAILABLE`, `DOCK_REASSIGNMENT`,
 `NO_DOCK_AVAILABLE`, `TRUCK_ARRIVING`; `severity` is `INFO`, `WARNING` or
 `CRITICAL`. Alerts are pushed, never polled.
+
+A delay activation emits `TRUCK_ETA_UPDATED`, then `TRUCK_STATUS_CHANGED`, then
+`ALERT_CREATED`. Clearing a delay emits the first two only — there is no
+"delay cleared" alert type. The persisted row is also readable at
+`GET /api/v1/alerts?type=TRUCK_DELAYED`, and its `metadata` carries the scenario,
+both speeds and the ETA shift in minutes.
 
 ### `DOCK_STATUS_CHANGED` *(contract only — Phase 8)*
 

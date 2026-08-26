@@ -36,6 +36,21 @@ const envSchema = z.object({
    * written per tick (§24) — only on transitions and these checkpoints.
    */
   SIMULATION_CHECKPOINT_PROGRESS_STEP: z.coerce.number().positive().max(100).default(5),
+
+  // --- Delay scenarios (Phase 6) ----------------------------------------
+  /**
+   * Effective speed = the truck's base speed x the multiplier for its active
+   * scenario (CLAUDE.md §7, "keep these values configurable").
+   *
+   * Every multiplier must be > 0. The base speed is recovered from a persisted
+   * row by dividing the stored speed by its scenario's multiplier, so a zero
+   * would make that irreversible — and a zero-speed truck covers no ground,
+   * which `advanceTruck` treats as "nothing to report". ROAD_CLOSURE is
+   * therefore a very strong slowdown rather than a full stop.
+   */
+  DELAY_MULTIPLIER_RAIN: z.coerce.number().positive().max(1).default(0.65),
+  DELAY_MULTIPLIER_TRAFFIC: z.coerce.number().positive().max(1).default(0.45),
+  DELAY_MULTIPLIER_ROAD_CLOSURE: z.coerce.number().positive().max(1).default(0.1),
 });
 
 const parsed = envSchema.safeParse(process.env);

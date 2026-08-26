@@ -1,5 +1,7 @@
 import { Router } from 'express';
 import {
+  applyTruckDelay,
+  clearTruckDelay,
   getSimulationState,
   getSimulationTruckState,
   resetSimulation,
@@ -14,3 +16,5 @@ simulationRouter.post('/stop', stopSimulation);
 simulationRouter.post('/reset', resetSimulation);
 simulationRouter.get('/state', getSimulationState);
 simulationRouter.get('/trucks/:truckId', getSimulationTruckState);
+simulationRouter.post('/trucks/:truckId/delay', applyTruckDelay);
+simulationRouter.post('/trucks/:truckId/clear-delay', clearTruckDelay);
