@@ -32,10 +32,21 @@ pnpm db:studio               # prisma studio
 because its `rootDir` is `./src`. Run `pnpm typecheck:seed` after touching the
 seed.
 
-Tests are Vitest + supertest in `tests/`, driving `createApp()` in-process (no
-port bound). They run **against the seeded development database** and are
-read-only, so `pnpm db:seed` must have run first. `tests/` sits outside the root
-`rootDir`, hence the separate `tsconfig.test.json`.
+Tests are Vitest in `tests/`, split by what they touch:
+
+- `read-api.test.ts` — supertest against `createApp()` in-process (no port bound),
+  running **against the seeded development database**, strictly read-only. It
+  asserts exact seeded values, so `pnpm db:seed` must have run first.
+- `simulation.test.ts` — pure engine tests. No database, no real timers: the
+  `SimulationManager` takes its store, event sink and clock by injection, so the
+  tests drive `manager.tick()` by hand against in-memory fakes.
+
+**Re-seed before `pnpm test` if `pnpm dev` has been running.** Autostart moves the
+same rows `read-api.test.ts` asserts on, so a long dev session will eventually
+break its `activeTrucks` / `delayedTrucks` counts. `NODE_ENV=test` force-disables
+autostart, so the suite itself never starts a loop.
+
+`tests/` sits outside the root `rootDir`, hence the separate `tsconfig.test.json`.
 
 Environment: copy `.env.example` to `.env`. `DATABASE_URL` is the only
 required variable; everything else has a default (`ARRIVAL_HORIZON_MINUTES`,
@@ -46,7 +57,7 @@ config via `import { env } from './config/index.js'`, never `process.env`
 
 ## Current state
 
-**Phases 1–3 are done.**
+**Phases 1–4 are done.**
 
 Phase 1 (foundation): config, logger, Prisma client, error handling,
 `/health` + `/api/v1/health` + `/api/v1/health/db`, bare Socket.IO server.
@@ -88,11 +99,36 @@ onto `apiV1Router`:
 /api/v1/yard/overview
 ```
 
-Full reference with example payloads: `docs/api.md`.
+Phase 4 (simulation engine): the backend now owns truck movement.
+`src/simulation/simulation-manager.ts` runs **one** interval every
+`SIMULATION_TICK_MS` (2000), advancing every truck whose status is
+`IN_TRANSIT`/`DELAYED`/`ARRIVING` (9 of the 12 seeded trucks) along its fixed
+route, and driving `IN_TRANSIT → ARRIVING → ARRIVED`. Supporting files:
 
-Still empty placeholder directories: `src/simulation`, `src/eta`, `src/docking`,
-`src/alerts`, `src/wms`. Sections 4–15, 22, 24–25 and 27–31 below describe the
-target system, not the code on disk.
+```text
+src/simulation/route-engine.ts       geometry math, memoised RouteProfile per route
+src/simulation/live-state.ts         LiveTruckState + the in-memory LiveStateStore
+src/simulation/truck-simulator.ts    advanceTruck() — the pure per-truck tick
+src/simulation/simulation-store.ts   the Prisma seam (loadTrucks / persist)
+src/simulation/simulation-events.ts  SimulationEventSink + payload types
+src/simulation/simulation-manager.ts the loop, persistence policy, event emission
+src/eta/eta-engine.ts                calculateEta / distanceTravelledKm (pure)
+```
+
+Control endpoints: `POST /api/v1/simulation/start|stop|reset`,
+`GET /api/v1/simulation/state`, `GET /api/v1/simulation/trucks/:truckId`.
+The loop starts in `server.ts` (never `createApp()`) when `env.simulationAutostart`
+is set. New env vars: `SIMULATION_TICK_MS`, `SIMULATION_AUTOSTART`,
+`SIMULATION_SPEED_MULTIPLIER`, `SIMULATION_ARRIVING_PROGRESS`,
+`SIMULATION_CHECKPOINT_PROGRESS_STEP`.
+
+Full reference with example payloads: `api-docs/api.md`.
+
+Still empty placeholder directories: `src/docking`, `src/alerts`, `src/wms`, and
+`src/websocket` holds only the bare Socket.IO server. Delay scenarios (§7) are
+Phase 6 and are **not** implemented — the engine simply uses each truck's stored
+`speedKmph`, which is why the seeded DELAYED trucks already crawl. Sections 7–15,
+24–25 and 27–31 below describe the target system, not the code on disk.
 
 ## Conventions that are easy to get wrong
 
@@ -149,7 +185,22 @@ target system, not the code on disk.
   both delegating to the same `getHealth` controller. `io.close()` also closes the
   shared HTTP server, which is why `shutdown()` tolerates `ERR_SERVER_NOT_RUNNING`.
 - **Logging** goes through `src/lib/logger.ts` (level-filtered console wrapper),
-  not bare `console.*`.
+  not bare `console.*`. Per-tick simulation chatter is `debug`, never `info`.
+- **Simulation state is in memory; Postgres is not a tick log.** `LiveTruckState`
+  is the source of truth between writes. A row is written only on a status
+  transition, once every `SIMULATION_CHECKPOINT_PROGRESS_STEP` percent of
+  progress, and on `stop()` (which flushes). `sequenceNumber`, `previous*` and
+  `lastPersistedProgress` never reach the database at all.
+- **`advanceTruck` is pure and elapsed-time based.** It takes `elapsedMs` and
+  returns a fresh state — it never mutates its input, reads a clock, or steps a
+  coordinate index. Route geometry is read-only and its `RouteProfile` is
+  memoised per route, so it is parsed and measured once, not per tick.
+- **The engine never imports Socket.IO.** It emits domain events into a
+  `SimulationEventSink` (§14). Phase 5 supplies the Socket.IO-backed sink.
+- **ETA holds steady under constant speed — that is correct.** `calculateEta`
+  returns an absolute wall-clock instant, so what counts down is the time
+  remaining, not the timestamp. An arrival time that drifts while the truck keeps
+  to its speed would mean the engine was guessing.
 
 ---
 
@@ -1072,7 +1123,7 @@ prisma/
   schema.prisma
   seed.ts
 
-docs/
+api-docs/
   architecture.md
   api.md
 ```

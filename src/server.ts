@@ -3,6 +3,7 @@ import { createApp } from './app.js';
 import { env } from './config/index.js';
 import { logger } from './lib/logger.js';
 import { disconnectPrisma } from './lib/prisma.js';
+import { simulationManager } from './simulation/simulation-manager.js';
 import { closeWebsocket, initWebsocket } from './websocket/index.js';
 
 const app = createApp();
@@ -15,6 +16,16 @@ httpServer.listen(env.PORT, env.HOST, () => {
   logger.info(`Health:    http://${env.HOST}:${env.PORT}/health`);
   logger.info(`API:       http://${env.HOST}:${env.PORT}/api/v1/health`);
   logger.info(`Socket.IO: ws://${env.HOST}:${env.PORT}/socket.io`);
+
+  // The simulation lives in this same process (§3) and is started here, not in
+  // createApp(), so the test suite never spins up a tick loop.
+  if (env.simulationAutostart) {
+    void simulationManager.start().catch((error: unknown) => {
+      logger.error('Failed to start the simulation', error);
+    });
+  } else {
+    logger.info('Simulation autostart disabled — POST /api/v1/simulation/start to run it');
+  }
 });
 
 let shuttingDown = false;
@@ -32,6 +43,10 @@ async function shutdown(signal: string): Promise<void> {
   forceExit.unref();
 
   try {
+    // §22 order: stop the simulation first, so no tick can write to a database
+    // connection that is about to close.
+    await simulationManager.stop();
+
     await closeWebsocket();
     logger.info('Socket.IO closed');
 

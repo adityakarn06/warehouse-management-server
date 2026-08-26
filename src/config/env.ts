@@ -15,6 +15,27 @@ const envSchema = z.object({
 
   /** How far ahead the yard overview looks when listing upcoming arrivals. */
   ARRIVAL_HORIZON_MINUTES: z.coerce.number().int().positive().default(120),
+
+  // --- Simulation (Phase 4) ---------------------------------------------
+  /** Locked by CLAUDE.md §4: the backend advances trucks every 2 seconds. */
+  SIMULATION_TICK_MS: z.coerce.number().int().positive().default(2000),
+  /**
+   * `z.coerce.boolean()` treats any non-empty string as true, so spell the
+   * accepted values out (same reason as `booleanQuery` in src/schemas/common.ts).
+   */
+  SIMULATION_AUTOSTART: z
+    .enum(['true', 'false'])
+    .default('true')
+    .transform((value) => value === 'true'),
+  /** 1 = real time. Raise it only to compress a demo; ETA scales with it. */
+  SIMULATION_SPEED_MULTIPLIER: z.coerce.number().positive().default(1),
+  /** Progress % at which a moving truck flips to ARRIVING. */
+  SIMULATION_ARRIVING_PROGRESS: z.coerce.number().min(1).max(100).default(95),
+  /**
+   * Progress % between periodic database checkpoints. Positions are never
+   * written per tick (§24) — only on transitions and these checkpoints.
+   */
+  SIMULATION_CHECKPOINT_PROGRESS_STEP: z.coerce.number().positive().max(100).default(5),
 });
 
 const parsed = envSchema.safeParse(process.env);
@@ -36,9 +57,17 @@ export const corsOrigin: '*' | string[] =
         .map((origin) => origin.trim())
         .filter(Boolean);
 
+/**
+ * Autostart is force-disabled under NODE_ENV=test: the read-API suite asserts on
+ * exact seeded values, and a running simulation would mutate them underneath it.
+ */
+export const simulationAutostart: boolean =
+  raw.SIMULATION_AUTOSTART && raw.NODE_ENV !== 'test';
+
 export const env = {
   ...raw,
   corsOrigin,
+  simulationAutostart,
   isProduction: raw.NODE_ENV === 'production',
   isDevelopment: raw.NODE_ENV === 'development',
 } as const;
