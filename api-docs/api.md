@@ -1,4 +1,4 @@
-# E2 Backend — REST API (Phases 3–7: read APIs, simulation control, docking)
+# E2 Backend — REST API (Phases 3–9: read APIs, simulation control, docking, WMS feed)
 
 Base URL: `http://localhost:4000`
 All domain endpoints live under `/api/v1`.
@@ -582,6 +582,165 @@ imports Socket.IO.
 
 ---
 
+## WMS feed (Phase 9)
+
+There is no real WMS. We simulate one: an external warehouse system pushing
+operational facts at the backend over HTTP (§15). Ingestion drives the same
+domain services every other phase writes through — the controller parses and
+delegates, and all business logic lives in `WmsEventHandler`.
+
+```text
+POST /wms/events -> WMS Controller -> WmsEventHandler -> { SimulationManager,
+                                                           DockService,
+                                                           AlertService }
+                                                      -> Prisma
+                                                      -> Socket.IO
+```
+
+| Method | Path | Body |
+| --- | --- | --- |
+| `POST` | `/api/v1/wms/events` | one typed event (discriminated on `eventType`) |
+| `POST` | `/api/v1/wms/simulate` | `{ "scenario"? }` — a deterministic scripted sequence |
+
+**No new realtime events.** Ingestion reuses the seven in
+[`realtime.md`](./realtime.md); a WMS message is a new *source*, not a new
+contract.
+
+**Trailer resolution.** `trailerId` accepts the WMS's own identifier
+(`TRL-101`), the truck reference (`TRK-101`) or the row id — tried in that
+order, 404 otherwise.
+
+### `POST /api/v1/wms/events`
+
+Six event types. Every one accepts an optional `occurredAt` (ISO 8601); the
+backend still stamps its own clock on the rows it writes, so a feed with a
+skewed clock cannot reorder the timeline.
+
+```jsonc
+// request — the shape from §15
+{
+  "eventType": "TRAILER_STATUS_UPDATED",
+  "trailerId": "TRL-101",
+  "status": "ARRIVING",
+  "eta": "2026-08-27T18:40:00.000Z",
+  "yardLocation": { "lat": 28.4, "lng": 77.2 }
+}
+```
+
+```jsonc
+// response
+{
+  "data": {
+    "eventType": "TRAILER_STATUS_UPDATED",
+    "applied": true,                       // false when the fact was already true
+    "truckId": "TRK-101",
+    "dockDoorId": null,
+    "effects": ["TRK-101 IN_TRANSIT -> ARRIVING"],
+    "emitted": ["TRUCK_STATUS_CHANGED", "ALERT_CREATED"],
+    "alert": { "alertId": "...", "type": "TRUCK_ARRIVING", "severity": "INFO" /* ... */ }
+  }
+}
+```
+
+| `eventType` | Fields | What the backend does |
+| --- | --- | --- |
+| `TRAILER_LOCATION_UPDATED` | `trailerId`, `yardLocation{lat,lng}`, `progress?`, `speedKmph?` | Moves the truck. Emits `TRUCK_POSITION_UPDATED`. Writes **no** `LocationHistory` row. Send `progress` too for a truck under simulation — see below. |
+| `TRAILER_STATUS_UPDATED` | `trailerId`, `status`, `eta?`, `yardLocation?` | Moves truck and shipment, snapshots the transition, raises one `TRUCK_ARRIVING` alert on entry to `ARRIVING`. |
+| `TRAILER_ARRIVED` | `trailerId`, `yardLocation?` | `ARRIVED`, progress 100, speed 0, ETA and delay cleared, parked at the route destination. |
+| `TRAILER_DOCKED` | `trailerId`, `dockCode` | Door → `OCCUPIED`, truck → `DOCKED`, shipment → `DOCKED`, one `LocationHistory(DOCKED)`. |
+| `DOCK_STATUS_UPDATED` | `dockCode`, `status`, `reason?` | `OCCUPIED` / release; `AVAILABLE` and `UNAVAILABLE` delegate to the operator command and inherit the Phase 8 cascade. |
+| `APPOINTMENT_UPDATED` | `appointmentReference`, `windowStart?`, `windowEnd?`, `expectedDurationMinutes?`, `notes?` | Moves the slot. Emits nothing. |
+
+Notes on behaviour:
+
+- **`status: "DELAYED"` and `status: "DOCKED"` are refused (400)** on
+  `TRAILER_STATUS_UPDATED`. The delay scenarios own `DELAYED` because they also
+  set `activeDelay`; accepting it here would produce a truck that is `DELAYED`
+  with `activeDelay: NORMAL`. `TRAILER_DOCKED` owns `DOCKED` because it checks
+  the truck actually holds that door and flips the door in the same
+  transaction — setting it here would record a docked trailer against a door
+  still reading `RESERVED`.
+- **A truck with an active delay cannot be put back on the road (409).** Moving
+  it to `IN_TRANSIT`/`ARRIVING` would leave `activeDelay: RAIN` and the reduced
+  speed standing next to a normal-looking status. Clear it with
+  `POST /api/v1/simulation/trucks/:truckId/clear-delay` first. Arriving is not
+  blocked: the journey is over, so `TRAILER_ARRIVED` ends the scenario with it.
+- **An arrival never moves a truck backwards.** `TRAILER_ARRIVED` for a trailer
+  that is already `ARRIVED`, `DOCKED` or `COMPLETED` is a no-op
+  (`applied: false`), so a retried or late message cannot restamp `arrivedAt`,
+  pull the shipment back from `DOCKED` or reverse the truck's status while the
+  door it is standing at stays `OCCUPIED`.
+- **`status: "RESERVED"` is refused (400) on `DOCK_STATUS_UPDATED`.** That is the
+  assignment engine's transition. `OCCUPIED` is the one status *only* this feed
+  may write — a trailer has physically backed in.
+- **`TRAILER_DOCKED` requires a committed assignment** on that door and answers
+  `409` otherwise, naming the door the truck actually holds. The WMS reports
+  physical reality; it does not create bookings the scoring engine never ranked.
+  It also refuses a door that is out of service, for the same reason the
+  `OCCUPIED` path does.
+- **`DOCK_STATUS_UPDATED { status: "AVAILABLE" }` on an `OCCUPIED` door releases
+  it** — completing whatever assignment was holding it, because a trailer
+  leaving the bay is a departure. On any other door it is the operator's
+  put-back-in-service command, which is a no-op unless the door is out of
+  service.
+- **Occupying a door that is out of service is refused (409).** Believing the
+  feed there would clear a fault nobody fixed.
+- **`APPOINTMENT_UPDATED` emits no realtime event.** §13 fixes the contract at
+  seven events and the frontend can re-read a window. Its real effect is on the
+  scoring engine — a moved slot re-ranks
+  `GET /api/v1/trucks/:truckId/dock-recommendations` through `appointmentFit`.
+  It is refused (400) if it changes nothing, or if the merged window would end
+  at or before it starts.
+- **Re-sending a fact that is already true is a success** with
+  `applied: false` and no second alert — a feed that retries must not collect
+  errors.
+- **Send `progress` alongside `yardLocation` when the simulation is running.**
+  The engine recomputes a moving truck's position from `progress` on its next
+  tick, so a lat/lng with no progress is corrected away about two seconds later.
+  With `progress` the update is a true resync — the engine picks up from the
+  reported point. For a truck parked in the yard the position sticks either way.
+- **`emitted` is reported by whoever emitted.** For a truck the engine is
+  tracking, the list comes from the engine — including `TRUCK_ETA_UPDATED`,
+  which it raises whenever a resync changes the arrival time.
+- `404` for an unknown trailer, dock or appointment; `400` for an unknown
+  `eventType` or a malformed payload, with the Zod issues in `error.details`.
+
+### `POST /api/v1/wms/simulate`
+
+Replays a fixed sequence through the same handler — there is no second code
+path, so whatever the demo proves, the real endpoint does too. Deterministic by
+name: no randomness anywhere (§25).
+
+```jsonc
+// request — body optional; defaults to TRAILER_ARRIVAL
+{ "scenario": "TRAILER_ARRIVAL" }
+```
+
+| Scenario | Sequence | Ends with |
+| --- | --- | --- |
+| `TRAILER_ARRIVAL` (default) | `TRAILER_LOCATION_UPDATED` → `TRAILER_STATUS_UPDATED(ARRIVING)` → `TRAILER_ARRIVED` → `TRAILER_DOCKED(D2)` on `TRL-101` | `D2` `OCCUPIED`, `TRK-101` `DOCKED`, `SHP-1001` `DOCKED` |
+| `DOCK_OCCUPANCY` | `D3` → `OCCUPIED` → `AVAILABLE` | `D3` back to `AVAILABLE` |
+| `APPOINTMENT_SHIFT` | `APT-2001` pushed out 60 min | re-ranked dock recommendations for `TRK-101` |
+
+```jsonc
+// response — one step per event, in the order it was fed
+{
+  "data": {
+    "scenario": "TRAILER_ARRIVAL",
+    "steps": [
+      { "eventType": "TRAILER_LOCATION_UPDATED", "ok": true, "result": { /* ... */ }, "error": null },
+      { "eventType": "TRAILER_DOCKED", "ok": true, "result": { /* ... */ }, "error": null }
+    ]
+  }
+}
+```
+
+A failing step is captured into its own entry and the run continues — a
+half-finished demo that says which half failed beats one that stops silently.
+`TRAILER_ARRIVAL` moves seeded demo rows, so **`pnpm db:seed` resets it**.
+
+---
+
 ## Example requests
 
 ```bash
@@ -669,4 +828,53 @@ curl -s 'http://localhost:4000/api/v1/alerts?type=NO_DOCK_AVAILABLE' | jq '.data
 
 # Hand a door back to the yard
 curl -s -X POST http://localhost:4000/api/v1/docks/D4/release | jq
+
+# --- WMS feed (Phase 9) ---
+
+# The scripted demo — TRL-101 arrives and backs into D2
+curl -s -X POST http://localhost:4000/api/v1/wms/simulate \
+  -H 'Content-Type: application/json' -d '{"scenario":"TRAILER_ARRIVAL"}' \
+  | jq '.data.steps[] | {eventType, ok, effects: .result.effects}'
+
+# D2 is now OCCUPIED, TRK-101 DOCKED
+curl -s http://localhost:4000/api/v1/docks/D2 | jq '.data.status'
+curl -s http://localhost:4000/api/v1/trucks/TRK-101 | jq '.data.status'
+
+# One hand-sent event
+curl -s -X POST http://localhost:4000/api/v1/wms/events \
+  -H 'Content-Type: application/json' -d '{
+    "eventType": "TRAILER_STATUS_UPDATED",
+    "trailerId": "TRL-102",
+    "status": "ARRIVING",
+    "yardLocation": { "lat": 22.585, "lng": 88.409 }
+  }' | jq '.data'
+
+# The WMS-only transition, and releasing the bay again
+curl -s -X POST http://localhost:4000/api/v1/wms/events -H 'Content-Type: application/json' \
+  -d '{"eventType":"DOCK_STATUS_UPDATED","dockCode":"D3","status":"OCCUPIED"}' | jq '.data.effects'
+curl -s -X POST http://localhost:4000/api/v1/wms/events -H 'Content-Type: application/json' \
+  -d '{"eventType":"DOCK_STATUS_UPDATED","dockCode":"D3","status":"AVAILABLE"}' | jq '.data.effects'
+
+# Scenario D through the feed: the backend still picks D4 itself
+curl -s -X POST http://localhost:4000/api/v1/wms/events -H 'Content-Type: application/json' \
+  -d '{"eventType":"DOCK_STATUS_UPDATED","dockCode":"D2","status":"UNAVAILABLE","reason":"WMS: leveler fault"}' \
+  | jq '{effects: .data.effects, emitted: .data.emitted}'
+
+# Rejected: DELAYED (the delay endpoints own it), RESERVED (the engine owns it),
+# an unknown trailer, and docking a door the truck was never assigned
+curl -s -X POST http://localhost:4000/api/v1/wms/events -H 'Content-Type: application/json' \
+  -d '{"eventType":"TRAILER_STATUS_UPDATED","trailerId":"TRL-102","status":"DELAYED"}' | jq '.error'   # 400
+curl -s -X POST http://localhost:4000/api/v1/wms/events -H 'Content-Type: application/json' \
+  -d '{"eventType":"TRAILER_STATUS_UPDATED","trailerId":"TRL-102","status":"DOCKED"}' | jq '.error'    # 400
+curl -s -X POST http://localhost:4000/api/v1/wms/events -H 'Content-Type: application/json' \
+  -d '{"eventType":"TRAILER_STATUS_UPDATED","trailerId":"TRL-103","status":"IN_TRANSIT"}' | jq '.error' # 409 — clear the delay first
+curl -s -X POST http://localhost:4000/api/v1/wms/events -H 'Content-Type: application/json' \
+  -d '{"eventType":"DOCK_STATUS_UPDATED","dockCode":"D3","status":"RESERVED"}' | jq '.error'           # 400
+curl -s -X POST http://localhost:4000/api/v1/wms/events -H 'Content-Type: application/json' \
+  -d '{"eventType":"TRAILER_DOCKED","trailerId":"TRL-999","dockCode":"D2"}' | jq '.error'              # 404
+curl -s -X POST http://localhost:4000/api/v1/wms/events -H 'Content-Type: application/json' \
+  -d '{"eventType":"TRAILER_DOCKED","trailerId":"TRL-101","dockCode":"D3"}' | jq '.error'              # 409
+
+# The scenario moves seeded demo rows — put them back
+pnpm db:seed
 ```

@@ -52,6 +52,11 @@ Tests are Vitest in `tests/`, split by what they touch:
   double-booking refusal, and recovery/release. Shares the snapshot/restore
   helpers in `tests/docking-fixtures.ts` (not a `.test.ts` file, so Vitest does
   not collect it).
+- `wms.test.ts` — the Phase 9 ingestion API via supertest. **Writes to the seeded
+  database** and restores it: it snapshots the yard *and* the fleet (trucks,
+  shipments, appointments, location history) and puts both back in `afterEach`.
+  It swaps **both** realtime seams onto one recorder, because the services it
+  delegates to emit through the docking sink, not the WMS one.
 - `realtime.test.ts` — the Socket.IO layer, also database-free: room routing
   against a recording `RealtimeEmitter`, the simulation→sink seam driving the real
   engine with a fake store, and an end-to-end test with two real `socket.io-client`
@@ -73,7 +78,7 @@ config via `import { env } from './config/index.js'`, never `process.env`
 
 ## Current state
 
-**Phases 1–8 are done.**
+**Phases 1–9 are done.**
 
 Phase 1 (foundation): config, logger, Prisma client, error handling,
 `/health` + `/api/v1/health` + `/api/v1/health/db`, bare Socket.IO server.
@@ -223,7 +228,32 @@ alert, `DOCK_REASSIGNED`) or reported as `NO_DOCK_AVAILABLE`. `POST
 left unexposed. New response field: `reassignments` on the PATCH body. No new env
 vars.
 
-Still empty placeholder directories: `src/alerts` and `src/wms`.
+Phase 9 (simulated WMS integration): the backend now takes facts from outside.
+
+```text
+src/schemas/wms.ts             the six inbound events, as a discriminated union
+src/wms/wms-event-handler.ts   handleWmsEvent — mapping, writes, alerts, emission
+src/wms/wms-realtime.ts        the WmsRealtimeSink seam + parked-truck payload builders
+src/wms/wms-scenarios.ts       runWmsScenario — the deterministic demo scripts
+```
+
+```text
+POST /api/v1/wms/events        one typed event, discriminated on `eventType`
+POST /api/v1/wms/simulate      { "scenario"? } — replays a fixed sequence
+```
+
+Six event types: `TRAILER_LOCATION_UPDATED`, `TRAILER_STATUS_UPDATED`,
+`TRAILER_ARRIVED`, `TRAILER_DOCKED`, `DOCK_STATUS_UPDATED`,
+`APPOINTMENT_UPDATED`. No migration and **no new realtime events** — ingestion
+reuses the seven in §13 and the enum members Phases 1-8 left unowned
+(`TruckStatus.DOCKED`, `ShipmentStatus.DOCKED`, `DockStatus.OCCUPIED`,
+`LocationSnapshotReason.DOCKED`/`COMPLETED`). `SimulationManager` gained
+`applyExternalUpdate()` and `nextSequence()`. New tests: `tests/wms.test.ts`
+(supertest, self-restoring) and an `external updates` suite in
+`tests/simulation.test.ts`. No new env vars.
+
+Still empty placeholder directory: `src/alerts` (alert logic lives in
+`src/services/alert-service.ts`).
 Sections 15, 24 and 27–31 below describe the target system, not the code on disk.
 
 ## Conventions that are easy to get wrong
@@ -446,6 +476,95 @@ Sections 15, 24 and 27–31 below describe the target system, not the code on di
   returns an absolute wall-clock instant, so what counts down is the time
   remaining, not the timestamp. An arrival time that drifts while the truck keeps
   to its speed would mean the engine was guessing.
+
+- **The WMS is a source, not a contract.** Phase 9 added no realtime events, no
+  alert types and no migration. Ingestion reuses the seven events in §13 and the
+  enum members earlier phases left unowned, so a frontend written against Phase 8
+  sees WMS-driven updates with no change. Adding an eighth event to broadcast an
+  appointment change would have cost a member, a room rule, a doc row and a
+  frontend release for a fact the frontend can re-read — its real effect is that
+  a moved window re-ranks dock recommendations through `appointmentFit`.
+- **`trailerId` is the third lookup arm.** `Truck.trailerId` (`TRL-101`) was
+  already `@unique` and seeded, so the WMS correlation key needed no schema
+  change. `findTruckByAnyKey` tries `id`, then `reference`, then `trailerId` —
+  the project's id-then-natural-key convention with one more fallback.
+- **`applyExternalUpdate` takes the `inFlight` barrier, and returns `null`
+  instead of throwing.** It copies `changeDelay`'s barrier for the same reason:
+  a tick firing mid-command advances the truck and then persists the
+  pre-command snapshot back over it, regressing `sequenceNumber` below the mark
+  clients drop updates against. It differs in one way that matters — a truck the
+  engine is not simulating (a stopped loop, or one parked in the yard, which
+  `load()` never selects) is not an error, because a WMS fact is true either
+  way. The handler writes Prisma directly on that branch and builds its own
+  payloads; a parked truck's interpolation target is its own position, which is
+  the honest answer rather than a degraded one.
+- **The WMS layer never emits truck events for a simulated truck.** The manager
+  does, through its own sink, so the single event path stays single (§14).
+- **`DELAYED`, `DOCKED` and `RESERVED` are refused at the schema.** Each belongs
+  to an endpoint that sets more than the one field: `DELAYED` to the delay
+  scenarios (which also set `activeDelay`), `DOCKED` to `TRAILER_DOCKED` (which
+  checks the assignment and flips the door in the same transaction), `RESERVED`
+  to the assignment engine. `OCCUPIED` is the one status only the feed may
+  write. The rule generalises: if a status has a co-ordinated write somewhere
+  else, the feed does not get to set it directly.
+- **The feed cannot put a delayed truck back on the road, but it can land one.**
+  Reporting `IN_TRANSIT`/`ARRIVING` for a truck whose `activeDelay` is not
+  `NORMAL` is a 409 pointing at `clear-delay` — otherwise the scenario and its
+  reduced speed would stand next to a normal-looking status, the mirror image of
+  the state the schema refuses. Arriving is exempt and clears the scenario
+  itself: the journey is over, so the delay is too.
+- **Status ladders only run forwards here.** `TRAILER_ARRIVED` for a trailer
+  already `ARRIVED`/`DOCKED`/`COMPLETED` is a no-op. A feed that retries or
+  delivers late must not restamp `arrivedAt`, pull a shipment back from
+  `DOCKED`, or reverse a truck standing at an `OCCUPIED` door.
+- **The handler mirrors the shipment on both branches.** The engine's `persist`
+  maps only the reasons *it* writes (`ARRIVING`/`ARRIVED`), so leaving the
+  mirror to it would move a shipment or not depending on whether the loop
+  happened to be running — one event, two answers.
+- **`applyExternalUpdate` reports what it emitted; callers never re-derive it.**
+  Only the engine knows what its comparison against *live* state raised, and a
+  caller reconstructing that from a database row would be wrong in both
+  directions (the row lags between checkpoints) and would miss
+  `TRUCK_ETA_UPDATED` entirely. `onTrailerDocked` uses the returned list to
+  decide whether it still needs to emit — emitting anyway would send
+  subscribers the same status change twice under two sequence numbers.
+- **A positional resync needs `progress`.** The engine recomputes a moving
+  truck's position from `progress` each tick, so a `TRAILER_LOCATION_UPDATED`
+  carrying only lat/lng is corrected away on the next one. That is honest
+  behaviour, not a bug — but the docs say to send `progress` too, and
+  `applyExternalUpdate` resets `lastTickAt` so the gap since the last tick is
+  not billed against the corrected position.
+- **"Make available" does not free an occupied door — `releaseDock` does.**
+  `setDockStatus`'s `AVAILABLE` branch is the operator's put-back-in-service
+  button and no-ops on any door that is not `UNAVAILABLE`, so routing the WMS
+  through it would have let the feed occupy a bay and never release it. A
+  trailer leaving is a departure, which is exactly `releaseDock`: it completes
+  whatever assignment was holding the door. Everything else still delegates to
+  `setDockStatus` and inherits the whole Phase 8 cascade.
+- **`TRAILER_DOCKED` needs a committed assignment and 409s without one.** The
+  WMS reports physical reality; it does not create bookings the scoring engine
+  never ranked, which keeps `DOCK_ASSIGNED` the only way a truck acquires a door.
+  Occupying a door that is out of service is refused for the mirror reason —
+  believing the feed there would clear a fault nobody fixed.
+- **Re-sending a fact that is already true is a success.** Every handler
+  short-circuits to `applied: false` with no second alert. A feed that retries
+  must not accumulate errors, and `/wms/simulate` is idempotent because of it.
+- **A position is still not a business event.** `TRAILER_LOCATION_UPDATED`
+  writes no `LocationHistory` row (§5, §24). It resyncs a live truck rather than
+  fighting it: `advanceTruck` is progress- and elapsed-time-based, so the engine
+  simply resumes from the reported point — which is why `applyExternalUpdate`
+  also resets that truck's `lastTickAt`, or the next tick would bill the whole
+  gap against the position the feed just corrected.
+- **`/wms/simulate` runs real events through the real handler.** There is no
+  second code path, so whatever the demo proves the endpoint does too. It is
+  deterministic by name (§25) and captures a failing step instead of aborting —
+  a half-finished demo that says which half failed beats one that stops
+  silently. `TRAILER_ARRIVAL` moves seeded demo rows, so `pnpm db:seed` resets it.
+- **The WMS suite restores trucks as well as the yard.** `restoreYard` only ever
+  covered doors, assignments and alerts; the feed also moves trucks, shipments,
+  appointments and location history, and `read-api.test.ts` asserts exact seeded
+  values. `snapshotFleet`/`restoreFleet` in `tests/docking-fixtures.ts` close
+  that gap.
 
 ---
 

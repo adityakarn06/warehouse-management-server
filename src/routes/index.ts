@@ -8,12 +8,10 @@ import { shipmentsRouter } from './shipments.routes.js';
 import { simulationRouter } from './simulation.routes.js';
 import { trackingRouter } from './tracking.routes.js';
 import { trucksRouter } from './trucks.routes.js';
+import { wmsRouter } from './wms.routes.js';
 import { yardRouter } from './yard.routes.js';
 
-/**
- * Everything mounted under /api/v1. The WMS router gets added here in a later
- * phase.
- */
+/** Everything mounted under /api/v1. */
 export const apiV1Router: Router = Router();
 
 apiV1Router.use('/health', healthRouter);
@@ -26,3 +24,4 @@ apiV1Router.use('/dock-assignments', dockAssignmentsRouter);
 apiV1Router.use('/alerts', alertsRouter);
 apiV1Router.use('/yard', yardRouter);
 apiV1Router.use('/simulation', simulationRouter);
+apiV1Router.use('/wms', wmsRouter);

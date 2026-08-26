@@ -1,6 +1,10 @@
 import { env } from '../config/index.js';
 import { calculateEta } from '../eta/eta-engine.js';
-import type { DelayScenario, LocationSnapshotReason } from '../generated/prisma/enums.js';
+import type {
+  DelayScenario,
+  LocationSnapshotReason,
+  TruckStatus,
+} from '../generated/prisma/enums.js';
 import { HttpError } from '../lib/http-error.js';
 import { logger } from '../lib/logger.js';
 import type { ActiveDelayScenario, DelayMultipliers } from './delay-scenarios.js';
@@ -21,7 +25,11 @@ import {
   pointAtProgress,
   remainingKm,
 } from './route-engine.js';
-import type { AlertCreatedPayload, SimulationEventSink } from './simulation-events.js';
+import type {
+  AlertCreatedPayload,
+  SimulationEventSink,
+  SimulationEventType,
+} from './simulation-events.js';
 import { loggerEventSink } from './simulation-events.js';
 import type { SimulationStore, SimulationTruckRow } from './simulation-store.js';
 import { prismaSimulationStore } from './simulation-store.js';
@@ -57,6 +65,35 @@ export interface DelayResult {
   truck: LiveTruckView;
   /** The alert the activation raised. Clearing a delay raises none. */
   alert: AlertCreatedPayload | null;
+}
+
+/**
+ * An authoritative fact from outside the engine (CLAUDE.md §15). Every field is
+ * optional: the WMS reports what it knows and nothing else. `eta: null` is
+ * meaningfully different from an absent `eta` — it clears the estimate, where
+ * absence means "recompute it from the reported position".
+ */
+export interface ExternalTruckUpdate {
+  latitude?: number;
+  longitude?: number;
+  progress?: number;
+  speedKmph?: number;
+  status?: TruckStatus;
+  activeDelay?: DelayScenario;
+  eta?: Date | null;
+  arrivedAt?: Date | null;
+}
+
+/**
+ * What an external update actually did. `emitted` is reported rather than
+ * reconstructed by the caller: only the engine knows which of the three events
+ * its comparison against *live* state raised, and a caller re-deriving that from
+ * a database row would be wrong in both directions (the row lags between
+ * checkpoints) and would miss `TRUCK_ETA_UPDATED` entirely.
+ */
+export interface ExternalUpdateResult {
+  truck: LiveTruckView;
+  emitted: SimulationEventType[];
 }
 
 interface TrackedTruck {
@@ -475,6 +512,143 @@ export class SimulationManager {
       logger.error(`Failed to raise delay alert for ${next.reference}`, error);
       return null;
     }
+  }
+
+  // --- External facts: the WMS feed (CLAUDE.md §15) -------------------------
+
+  /**
+   * The next sequence number for a truck, whether or not the live store is
+   * tracking it. The WMS handler builds payloads by hand for trucks parked in
+   * the yard (`ARRIVED`/`DOCKED`/`COMPLETED` are never loaded), and those
+   * events still have to clear the high-water mark clients drop updates below.
+   */
+  nextSequence(truckId: string): number {
+    const next = (this.lastSequence.get(truckId) ?? 0) + 1;
+    this.lastSequence.set(truckId, next);
+    return next;
+  }
+
+  /**
+   * Absorb an authoritative fact from outside the engine — the WMS feed saying
+   * where a trailer actually is, or what it is actually doing.
+   *
+   * Returns `null` when the truck is not being simulated: a stopped loop, or a
+   * truck parked in the yard. Unlike `changeDelay` this never throws for those
+   * cases — a WMS fact is true whether or not we happen to be simulating, and
+   * the caller writes Prisma directly instead.
+   *
+   * Takes the `inFlight` barrier for exactly the reason `changeDelay` does: a
+   * tick firing mid-command would advance the truck and then `persist` the
+   * pre-command snapshot back over it, rolling the position back and regressing
+   * `sequenceNumber` below the mark dashboards drop updates against.
+   */
+  async applyExternalUpdate(
+    idOrReference: string,
+    update: ExternalTruckUpdate,
+    reason: LocationSnapshotReason | null = null,
+  ): Promise<ExternalUpdateResult | null> {
+    while (this.inFlight !== null) {
+      await this.inFlight;
+    }
+
+    const run = this.runExternalUpdate(idOrReference, update, reason);
+    // The barrier tick() and stop() await must never reject.
+    this.inFlight = run.then(
+      () => undefined,
+      () => undefined,
+    );
+
+    try {
+      return await run;
+    } finally {
+      this.inFlight = null;
+    }
+  }
+
+  private async runExternalUpdate(
+    idOrReference: string,
+    update: ExternalTruckUpdate,
+    reason: LocationSnapshotReason | null,
+  ): Promise<ExternalUpdateResult | null> {
+    const state = this.live.get(idOrReference);
+    // Not an error: the yard is full of trucks the engine never loads.
+    if (!state) return null;
+
+    const now = new Date(this.deps.now());
+    const profile = this.profiles.get(state.truckId);
+
+    const progress = update.progress ?? state.progress;
+    const speedKmph = update.speedKmph ?? state.speedKmph;
+    const status = update.status ?? state.status;
+
+    // An explicit `eta` wins — including an explicit null. Otherwise recompute
+    // it from the reported position, so a resync never leaves a stale arrival
+    // time standing next to a new position (§6).
+    const eta =
+      update.eta !== undefined
+        ? update.eta
+        : profile && speedKmph > 0 && isMoving(status)
+          ? calculateEta({
+              remainingKm: remainingKm(profile, progress),
+              speedKmph,
+              now,
+              speedMultiplier: this.deps.speedMultiplier,
+            })
+          : state.eta;
+
+    const moved =
+      update.latitude !== undefined ||
+      update.longitude !== undefined ||
+      update.progress !== undefined;
+
+    const next: LiveTruckState = {
+      ...state,
+      ...(moved
+        ? { previousLatitude: state.latitude, previousLongitude: state.longitude }
+        : {}),
+      latitude: update.latitude ?? state.latitude,
+      longitude: update.longitude ?? state.longitude,
+      progress,
+      speedKmph,
+      status,
+      activeDelay: update.activeDelay ?? state.activeDelay,
+      eta,
+      // `!== undefined`, not `??`: an explicit null clears the arrival, the way
+      // an explicit null clears the ETA two fields up.
+      arrivedAt: update.arrivedAt !== undefined ? update.arrivedAt : state.arrivedAt,
+      lastUpdatedAt: now,
+      sequenceNumber: (this.lastSequence.get(state.truckId) ?? state.sequenceNumber) + 1,
+      dirty: true,
+    };
+
+    this.live.set(next);
+    this.lastSequence.set(next.truckId, next.sequenceNumber);
+    // The engine's own clock for this truck: without it the next tick would
+    // bill the whole gap since the last tick against the position the WMS just
+    // corrected, undoing the resync.
+    this.lastTickAt.set(next.truckId, this.deps.now());
+
+    const emitted: SimulationEventType[] = [];
+
+    if (moved && profile) {
+      this.emitPosition(next, profile);
+      emitted.push('TRUCK_POSITION_UPDATED');
+    }
+    if ((eta?.getTime() ?? null) !== (state.eta?.getTime() ?? null)) {
+      this.emitEta(next);
+      emitted.push('TRUCK_ETA_UPDATED');
+    }
+    // Also on a scenario change that leaves the status alone: TRUCK_STATUS_CHANGED
+    // is the only payload carrying `activeDelay` (same rule as `changeDelay`).
+    if (next.status !== state.status || next.activeDelay !== state.activeDelay) {
+      this.emitStatus(next, state.status);
+      emitted.push('TRUCK_STATUS_CHANGED');
+    }
+
+    await this.persist(next, reason);
+
+    // Re-read: persist() rewrites the entry with its checkpoint bookkeeping.
+    return { truck: toLiveTruckView(this.live.get(next.truckId) ?? next), emitted };
   }
 
   // -------------------------------------------------------------------------

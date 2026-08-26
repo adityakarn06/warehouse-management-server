@@ -1031,3 +1031,100 @@ describe('delay scenarios', () => {
     expect(h.store.alerts).toHaveLength(0);
   });
 });
+
+describe('external updates (the WMS feed)', () => {
+  beforeEach(() => clearRouteProfileCache());
+
+  async function movingHarness(): Promise<Harness> {
+    const h = harness();
+    await h.manager.start();
+    await h.advance(ONE_HOUR / 6); // 10 km in, so there is a journey behind it
+    return h;
+  }
+
+  it('resyncs a live truck to the reported position', async () => {
+    const h = await movingHarness();
+
+    const result = await h.manager.applyExternalUpdate('TRK-TEST', {
+      latitude: 1.5,
+      longitude: 0,
+      progress: 40,
+      speedKmph: 30,
+    });
+
+    expect(result).not.toBeNull();
+    expect(result?.truck.progress).toBe(40);
+    expect(result?.truck.speedKmph).toBe(30);
+    expect(h.manager.getTruckState('TRK-TEST')?.progress).toBe(40);
+
+    // The reported jump is a position change like any other.
+    expect(h.sink.ofType('TRUCK_POSITION_UPDATED').length).toBeGreaterThan(0);
+  });
+
+  it('bumps the sequence number past the high-water mark', async () => {
+    const h = await movingHarness();
+    const before = h.manager.getTruckState('TRK-TEST')?.sequenceNumber ?? 0;
+
+    const result = await h.manager.applyExternalUpdate('TRK-TEST', { progress: 50 });
+
+    expect(result?.truck.sequenceNumber).toBeGreaterThan(before);
+  });
+
+  it('recomputes the ETA from the reported position rather than leaving it stale', async () => {
+    const h = await movingHarness();
+    const before = h.manager.getTruckState('TRK-TEST')?.eta;
+    if (!before) throw new Error('expected a baseline ETA');
+
+    // Most of the way there: far less distance left, so the arrival moves in.
+    const result = await h.manager.applyExternalUpdate('TRK-TEST', { progress: 90 });
+
+    expect(result?.truck.eta).not.toBeNull();
+    expect(result?.truck.eta?.getTime()).toBeLessThan(before.getTime());
+  });
+
+  it('takes an explicit null eta as a clear, not as "recompute"', async () => {
+    const h = await movingHarness();
+
+    const result = await h.manager.applyExternalUpdate('TRK-TEST', { status: 'ARRIVED', eta: null });
+
+    expect(result?.truck.eta).toBeNull();
+    expect(result?.truck.status).toBe('ARRIVED');
+    expect(h.sink.ofType('TRUCK_STATUS_CHANGED').at(-1)?.data).toMatchObject({
+      status: 'ARRIVED',
+    });
+  });
+
+  it('writes a location history row only when given a reason', async () => {
+    const h = await movingHarness();
+
+    await h.manager.applyExternalUpdate('TRK-TEST', { progress: 60 }, null);
+    const positionOnly = h.store.persisted.at(-1);
+    expect(positionOnly?.reason).toBeNull();
+
+    await h.manager.applyExternalUpdate('TRK-TEST', { status: 'ARRIVED' }, 'ARRIVED');
+    expect(h.store.persisted.at(-1)?.reason).toBe('ARRIVED');
+  });
+
+  it('returns null for a truck the engine is not simulating', async () => {
+    const h = await movingHarness();
+
+    expect(await h.manager.applyExternalUpdate('TRK-NOT-LOADED', { progress: 10 })).toBeNull();
+  });
+
+  it('does not interleave with a tick', async () => {
+    const h = await movingHarness();
+
+    // Both in flight at once: the barrier must serialise them, so the update is
+    // not undone by a tick persisting the pre-command snapshot over it.
+    await Promise.all([
+      h.manager.applyExternalUpdate('TRK-TEST', { progress: 75, speedKmph: 40 }),
+      h.advance(),
+    ]);
+
+    const state = h.manager.getTruckState('TRK-TEST');
+    expect(state?.progress).toBeGreaterThanOrEqual(75);
+    expect(state?.sequenceNumber).toBe(
+      Math.max(...h.sink.events.map((event) => ('sequenceNumber' in event.data ? event.data.sequenceNumber : 0))),
+    );
+  });
+});

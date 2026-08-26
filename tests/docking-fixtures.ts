@@ -1,4 +1,10 @@
-import type { AssignmentStatus, DockStatus } from '../src/generated/prisma/enums.js';
+import type {
+  AssignmentStatus,
+  DelayScenario,
+  DockStatus,
+  ShipmentStatus,
+  TruckStatus,
+} from '../src/generated/prisma/enums.js';
 import type { DockingEvent, DockingEventSink } from '../src/docking/docking-events.js';
 import { prisma } from '../src/lib/prisma.js';
 
@@ -104,6 +110,119 @@ export async function restoreYard(snapshot: YardSnapshot): Promise<void> {
         releasedAt: assignment.releasedAt,
         reassignedAt: assignment.reassignedAt,
         previousAssignmentId: assignment.previousAssignmentId,
+      },
+    });
+  }
+}
+
+// --- Fleet snapshot (Phase 9) ----------------------------------------------
+//
+// `restoreYard` covers doors, assignments and alerts — everything the docking
+// suites touch. The WMS feed reaches further: it moves trucks, mirrors
+// shipments, rewrites appointment windows and writes location history. Since
+// `read-api.test.ts` asserts exact seeded truck and shipment values (TRK-103
+// and TRK-106 are the only DELAYED trucks, `summary.delayedTrucks === 2`), a
+// WMS suite that skipped this would break it two files later.
+
+interface TruckSnapshot {
+  id: string;
+  status: TruckStatus;
+  activeDelay: DelayScenario;
+  currentLatitude: number;
+  currentLongitude: number;
+  progress: number;
+  speedKmph: number;
+  eta: Date | null;
+  arrivedAt: Date | null;
+  lastUpdatedAt: Date;
+}
+
+interface AppointmentSnapshot {
+  id: string;
+  windowStart: Date;
+  windowEnd: Date;
+  expectedDurationMinutes: number;
+  notes: string | null;
+}
+
+export interface FleetSnapshot {
+  trucks: TruckSnapshot[];
+  shipments: { id: string; status: ShipmentStatus }[];
+  appointments: AppointmentSnapshot[];
+  locationHistoryIds: string[];
+}
+
+export async function snapshotFleet(): Promise<FleetSnapshot> {
+  const [trucks, shipments, appointments, history] = await Promise.all([
+    prisma.truck.findMany({
+      select: {
+        id: true,
+        status: true,
+        activeDelay: true,
+        currentLatitude: true,
+        currentLongitude: true,
+        progress: true,
+        speedKmph: true,
+        eta: true,
+        arrivedAt: true,
+        lastUpdatedAt: true,
+      },
+    }),
+    prisma.shipment.findMany({ select: { id: true, status: true } }),
+    prisma.appointment.findMany({
+      select: {
+        id: true,
+        windowStart: true,
+        windowEnd: true,
+        expectedDurationMinutes: true,
+        notes: true,
+      },
+    }),
+    prisma.locationHistory.findMany({ select: { id: true } }),
+  ]);
+
+  return {
+    trucks,
+    shipments,
+    appointments,
+    locationHistoryIds: history.map((row) => row.id),
+  };
+}
+
+export async function restoreFleet(snapshot: FleetSnapshot): Promise<void> {
+  await prisma.locationHistory.deleteMany({
+    where: { id: { notIn: snapshot.locationHistoryIds } },
+  });
+
+  for (const truck of snapshot.trucks) {
+    await prisma.truck.update({
+      where: { id: truck.id },
+      data: {
+        status: truck.status,
+        activeDelay: truck.activeDelay,
+        currentLatitude: truck.currentLatitude,
+        currentLongitude: truck.currentLongitude,
+        progress: truck.progress,
+        speedKmph: truck.speedKmph,
+        eta: truck.eta,
+        arrivedAt: truck.arrivedAt,
+        lastUpdatedAt: truck.lastUpdatedAt,
+      },
+    });
+  }
+
+  for (const shipment of snapshot.shipments) {
+    await prisma.shipment.update({ where: { id: shipment.id }, data: { status: shipment.status } });
+  }
+
+  for (const appointment of snapshot.appointments) {
+    await prisma.appointment.update({
+      where: { id: appointment.id },
+      data: {
+        windowStart: appointment.windowStart,
+        windowEnd: appointment.windowEnd,
+        expectedDurationMinutes: appointment.expectedDurationMinutes,
+        notes: appointment.notes,
       },
     });
   }

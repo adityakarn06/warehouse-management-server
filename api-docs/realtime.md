@@ -1,4 +1,4 @@
-# E2 Backend — Socket.IO Realtime API (Phases 5–7)
+# E2 Backend — Socket.IO Realtime API (Phases 5–9)
 
 Everything the frontend needs to consume live truck movement, alerts and dock
 changes. The REST surface is documented separately in [`api.md`](./api.md).
@@ -146,19 +146,27 @@ Events are emitted **by name** — there is no `{ type, data }` envelope on the 
 socket.on('TRUCK_POSITION_UPDATED', (data) => { /* data is TruckPositionPayload */ });
 ```
 
-| Event | Rooms | Emitted since |
-| --- | --- | --- |
-| `TRUCK_POSITION_UPDATED` | `operations`, `truck:{id}`, `shipment:{id}` | Phase 5 |
-| `TRUCK_ETA_UPDATED` | `operations`, `truck:{id}`, `shipment:{id}` | Phase 5 |
-| `TRUCK_STATUS_CHANGED` | `operations`, `truck:{id}`, `shipment:{id}` | Phase 5 |
-| `ALERT_CREATED` | `operations` + the truck/shipment it names | Phase 6 |
-| `DOCK_STATUS_CHANGED` | `operations` | Phase 7 |
-| `DOCK_ASSIGNED` | `operations`, `truck:{id}`, `shipment:{id}` | Phase 7 |
-| `DOCK_REASSIGNED` | `operations`, `truck:{id}`, `shipment:{id}` | Phase 8 |
+| Event | Rooms | Emitted since | Raised by |
+| --- | --- | --- | --- |
+| `TRUCK_POSITION_UPDATED` | `operations`, `truck:{id}`, `shipment:{id}` | Phase 5 | simulation, WMS |
+| `TRUCK_ETA_UPDATED` | `operations`, `truck:{id}`, `shipment:{id}` | Phase 5 | simulation, WMS |
+| `TRUCK_STATUS_CHANGED` | `operations`, `truck:{id}`, `shipment:{id}` | Phase 5 | simulation, WMS |
+| `ALERT_CREATED` | `operations` + the truck/shipment it names | Phase 6 | delays, docking, WMS |
+| `DOCK_STATUS_CHANGED` | `operations` | Phase 7 | docking, WMS |
+| `DOCK_ASSIGNED` | `operations`, `truck:{id}`, `shipment:{id}` | Phase 7 | docking |
+| `DOCK_REASSIGNED` | `operations`, `truck:{id}`, `shipment:{id}` | Phase 8 | dock-failure cascade |
 
 Every event above is live. `ALERT_CREATED` went live in Phase 6 with the delay
 commands; the three dock events followed in Phases 7-8, with `DOCK_REASSIGNED`
 raised only by the dock-failure cascade.
+
+**Phase 9 added no events.** The WMS feed (`POST /api/v1/wms/events`) is a new
+*source*, not a new contract: ingestion reuses the seven above, so a client
+written against Phase 8 needs no change to see WMS-driven updates. A trailer the
+engine is simulating is emitted by the simulation manager as usual; one parked
+in the yard gets a hand-built payload whose interpolation target is its own
+position, because it is standing still. `APPOINTMENT_UPDATED` deliberately
+emits nothing — see `api.md`.
 
 Payloads carry ids and scalars only (§24) — never route geometry, never a full
 database record.
