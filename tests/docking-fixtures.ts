@@ -53,10 +53,22 @@ interface AssignmentSnapshot {
   previousAssignmentId: string | null;
 }
 
+/**
+ * Seeded alerts are restored, not just preserved: a suite that acknowledges one
+ * through the API would otherwise leave `read-api.test.ts`'s
+ * `?acknowledged=false` counts short by one, and deleting non-seeded rows alone
+ * does not put that back.
+ */
+interface AlertSnapshot {
+  id: string;
+  acknowledged: boolean;
+  acknowledgedAt: Date | null;
+}
+
 export interface YardSnapshot {
   docks: DockSnapshot[];
   assignments: AssignmentSnapshot[];
-  alertIds: string[];
+  alerts: AlertSnapshot[];
 }
 
 export async function snapshotYard(): Promise<YardSnapshot> {
@@ -75,10 +87,10 @@ export async function snapshotYard(): Promise<YardSnapshot> {
         previousAssignmentId: true,
       },
     }),
-    prisma.alert.findMany({ select: { id: true } }),
+    prisma.alert.findMany({ select: { id: true, acknowledged: true, acknowledgedAt: true } }),
   ]);
 
-  return { docks, assignments, alertIds: alerts.map((row) => row.id) };
+  return { docks, assignments, alerts };
 }
 
 export async function restoreYard(snapshot: YardSnapshot): Promise<void> {
@@ -87,7 +99,9 @@ export async function restoreYard(snapshot: YardSnapshot): Promise<void> {
   // Rows first: a replacement row still pointing at a seeded one would block
   // restoring that row's own chain, and an assignment on a door blocks its reset.
   await prisma.dockAssignment.deleteMany({ where: { id: { notIn: seededIds } } });
-  await prisma.alert.deleteMany({ where: { id: { notIn: snapshot.alertIds } } });
+  await prisma.alert.deleteMany({
+    where: { id: { notIn: snapshot.alerts.map((row) => row.id) } },
+  });
 
   for (const dock of snapshot.docks) {
     await prisma.dockDoor.update({
@@ -97,6 +111,13 @@ export async function restoreYard(snapshot: YardSnapshot): Promise<void> {
         availableFrom: dock.availableFrom,
         unavailableReason: dock.unavailableReason,
       },
+    });
+  }
+
+  for (const alert of snapshot.alerts) {
+    await prisma.alert.update({
+      where: { id: alert.id },
+      data: { acknowledged: alert.acknowledged, acknowledgedAt: alert.acknowledgedAt },
     });
   }
 
@@ -133,6 +154,7 @@ interface TruckSnapshot {
   progress: number;
   speedKmph: number;
   eta: Date | null;
+  departedAt: Date | null;
   arrivedAt: Date | null;
   lastUpdatedAt: Date;
 }
@@ -164,6 +186,7 @@ export async function snapshotFleet(): Promise<FleetSnapshot> {
         progress: true,
         speedKmph: true,
         eta: true,
+        departedAt: true,
         arrivedAt: true,
         lastUpdatedAt: true,
       },
@@ -205,6 +228,7 @@ export async function restoreFleet(snapshot: FleetSnapshot): Promise<void> {
         progress: truck.progress,
         speedKmph: truck.speedKmph,
         eta: truck.eta,
+        departedAt: truck.departedAt,
         arrivedAt: truck.arrivedAt,
         lastUpdatedAt: truck.lastUpdatedAt,
       },

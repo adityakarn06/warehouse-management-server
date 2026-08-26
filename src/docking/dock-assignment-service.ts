@@ -8,6 +8,7 @@ import type {
   TruckStatus,
 } from '../generated/prisma/enums.js';
 import { HttpError } from '../lib/http-error.js';
+import { withYardLock } from './dock-lock.js';
 import { prisma } from '../lib/prisma.js';
 import { assignmentRecencyOrder, committedAssignmentWhere } from '../services/selects.js';
 import { dockingSink, dockReassignedEvent, dockStatusChangedEvent } from './docking-events.js';
@@ -427,6 +428,18 @@ export async function assignDock(
   dockIdOrCode?: string,
   now = new Date(),
 ): Promise<AssignmentResult> {
+  // Serialised against every other yard write: scoring reads before the write,
+  // so two concurrent callers would otherwise both see the same door free.
+  return withYardLock(`assignDock ${truckIdOrReference}`, () =>
+    runAssignDock(truckIdOrReference, dockIdOrCode, now),
+  );
+}
+
+async function runAssignDock(
+  truckIdOrReference: string,
+  dockIdOrCode: string | undefined,
+  now: Date,
+): Promise<AssignmentResult> {
   const loaded = await loadContext(truckIdOrReference, now);
   const { truck, slot, scored, current } = loaded;
 
@@ -605,10 +618,14 @@ export interface ReleaseResult {
  * that is stuck holding a stale booking.
  */
 export async function releaseDock(dockIdOrCode: string, now = new Date()): Promise<ReleaseResult> {
+  return withYardLock(`releaseDock ${dockIdOrCode}`, () => runReleaseDock(dockIdOrCode, now));
+}
+
+async function runReleaseDock(dockIdOrCode: string, now: Date): Promise<ReleaseResult> {
   const dock = await findDock(dockIdOrCode);
   const held = dock.assignments;
 
-  const updated = await prisma.$transaction(async (tx) => {
+  const { updated, liveStatusBefore } = await prisma.$transaction(async (tx) => {
     if (held.length > 0) {
       // Every committed row, not just the newest: handing the door back while
       // one of them is still ASSIGNED would report a committed door as free.
@@ -618,21 +635,38 @@ export async function releaseDock(dockIdOrCode: string, now = new Date()): Promi
       });
     }
 
-    // A door that is out of service stays out of service — releasing a booking
-    // does not silently put a broken dock back into rotation.
-    if (dock.status === 'UNAVAILABLE') {
-      return { id: dock.id, code: dock.code, status: dock.status, unavailableReason: dock.unavailableReason };
-    }
-
-    return tx.dockDoor.update({
+    // Re-read inside the transaction rather than trusting `findDock`'s snapshot:
+    // that read happened before the transaction opened, and a door taken out of
+    // service in between must not be handed back to the yard on the strength of
+    // a stale AVAILABLE. Same reasoning as `dockStillTakes`.
+    const live = await tx.dockDoor.findUniqueOrThrow({
       where: { id: dock.id },
-      data: { status: 'AVAILABLE', availableFrom: null },
       select: { id: true, code: true, status: true, unavailableReason: true },
     });
+
+    // A door that is out of service stays out of service — releasing a booking
+    // does not silently put a broken dock back into rotation.
+    if (live.status === 'UNAVAILABLE') {
+      return { updated: live, liveStatusBefore: live.status };
+    }
+
+    return {
+      updated: await tx.dockDoor.update({
+        where: { id: dock.id },
+        data: { status: 'AVAILABLE', availableFrom: null },
+        select: { id: true, code: true, status: true, unavailableReason: true },
+      }),
+      liveStatusBefore: live.status,
+    };
   });
 
-  if (updated.status !== dock.status) {
-    dockingSink().emit(dockStatusChangedEvent(updated, dock.status, now));
+  // Compared against the status read *inside* the transaction, not against
+  // `findDock`'s earlier snapshot. If the door went UNAVAILABLE in between, the
+  // stale comparison would emit a second DOCK_STATUS_CHANGED reporting an
+  // AVAILABLE -> UNAVAILABLE transition this call never made — and that
+  // `setDockStatus` has already broadcast.
+  if (updated.status !== liveStatusBefore) {
+    dockingSink().emit(dockStatusChangedEvent(updated, liveStatusBefore, now));
   }
 
   return {
@@ -687,6 +721,20 @@ export async function reassignDock(
   previousAssignmentId: string,
   reason: string,
   now = new Date(),
+): Promise<ReassignResult> {
+  // The failure cascade calls this once per affected truck, and each call is
+  // hunting the same shrinking pool of doors — exactly the case the lock exists
+  // for. `handleDockFailure` stays outside it so the loop does not self-deadlock.
+  return withYardLock(`reassignDock ${truckIdOrReference}`, () =>
+    runReassignDock(truckIdOrReference, previousAssignmentId, reason, now),
+  );
+}
+
+async function runReassignDock(
+  truckIdOrReference: string,
+  previousAssignmentId: string,
+  reason: string,
+  now: Date,
 ): Promise<ReassignResult> {
   const previous = await prisma.dockAssignment.findUnique({
     where: { id: previousAssignmentId },

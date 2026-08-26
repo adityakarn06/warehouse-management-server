@@ -103,7 +103,10 @@ export async function closeWebsocket(): Promise<void> {
 
   server.disconnectSockets(true);
 
-  await new Promise<void>((resolve) => {
-    server.close(() => resolve());
-  });
+  // `close()` returns a promise *and* takes a callback. The promise is the
+  // simpler of the two here, but note it never rejects: socket.io hands any
+  // error to the callback and then resolves unconditionally, so a close failure
+  // is not observable this way. That is acceptable — this runs on the shutdown
+  // path, where `httpServer.close()` reports the same failure a moment later.
+  await server.close();
 }

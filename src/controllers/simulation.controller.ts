@@ -18,12 +18,14 @@ import { simulationManager } from '../simulation/simulation-manager.js';
  * frontend never has to compute or re-read it (§2).
  */
 
+/**
+ * The loop's own state, including `lastTickAt` / `lastTickError` so a dashboard
+ * can tell a healthy engine from a wedged one. Per-truck tick failures are
+ * swallowed to keep the interval alive (§22), which would otherwise make the
+ * two indistinguishable from outside.
+ */
 function status() {
-  return {
-    running: simulationManager.isRunning(),
-    truckCount: simulationManager.truckCount,
-    tickMs: simulationManager.tickMs,
-  };
+  return simulationManager.health();
 }
 
 export async function startSimulation(_req: Request, res: Response): Promise<void> {

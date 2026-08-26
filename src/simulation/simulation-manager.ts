@@ -118,8 +118,15 @@ export class SimulationManager {
   private readonly lastSequence = new Map<string, number>();
 
   private timer: NodeJS.Timeout | null = null;
-  /** In-flight tick(), so stop() can wait for it instead of racing it. */
+  /** In-flight tick() *or* stop()'s flush, so callers queue instead of racing. */
   private inFlight: Promise<void> | null = null;
+  /**
+   * Loop health, surfaced on `GET /api/v1/simulation/state`. A tick failure is
+   * swallowed per truck so the interval survives, which means a wedged engine
+   * would otherwise look identical to a healthy one from outside.
+   */
+  private lastTickAtMs: number | null = null;
+  private lastTickError: string | null = null;
   /**
    * Lifecycle queue. start/stop/reset all await database work, so without a
    * queue two of them can interleave: concurrent starts each install an
@@ -166,6 +173,23 @@ export class SimulationManager {
 
   get delayMultipliers(): DelayMultipliers {
     return this.deps.delayMultipliers;
+  }
+
+  /**
+   * What the loop is actually doing, for the dashboard and for the demo
+   * operator. This is the body of `POST /api/v1/simulation/start|stop|reset` —
+   * *not* `GET /simulation/state`, which returns the per-truck list.
+   * `lastTickError` holds the most recent per-truck failure and is cleared by
+   * the first clean tick after it.
+   */
+  health(): { running: boolean; truckCount: number; tickMs: number; lastTickAt: string | null; lastTickError: string | null } {
+    return {
+      running: this.isRunning(),
+      truckCount: this.truckCount,
+      tickMs: this.deps.tickMs,
+      lastTickAt: this.lastTickAtMs === null ? null : new Date(this.lastTickAtMs).toISOString(),
+      lastTickError: this.lastTickError,
+    };
   }
 
   /** Runs `op` after every lifecycle operation already queued. */
@@ -220,23 +244,50 @@ export class SimulationManager {
   }
 
   private async runStop(): Promise<void> {
-    if (this.timer === null) {
-      logger.debug('Simulation stop() called while not running');
-      return;
+    const wasRunning = this.timer !== null;
+
+    if (this.timer !== null) {
+      clearInterval(this.timer);
+      this.timer = null;
     }
 
-    clearInterval(this.timer);
-    this.timer = null;
-
-    // Let a tick that is mid-persist finish first. Flushing underneath it would
-    // write the older snapshot last, and in shutdown its transaction would
-    // outlive stop() and race disconnectPrisma().
-    if (this.inFlight !== null) {
+    // Let a tick or a command that is mid-persist finish first. Flushing
+    // underneath one would write the older snapshot last, and in shutdown its
+    // transaction would outlive stop() and race disconnectPrisma().
+    while (this.inFlight !== null) {
       await this.inFlight;
     }
 
-    const flushed = await this.flush();
-    logger.info(`Simulation stopped: ${this.live.size} truck(s), ${flushed} snapshot(s) flushed`);
+    // Then flush *while still holding the barrier*. Releasing it first would let
+    // a command parked in `applyExternalUpdate`'s own `while (this.inFlight !==
+    // null)` loop claim the slot between the drain and the flush and persist
+    // behind it — leaving its fresh state unwritten, and at shutdown issuing a
+    // transaction that outlives stop(). Nothing awaits between the loop above
+    // and the assignment below, which is what makes the claim safe (the same
+    // reasoning `changeDelay` relies on).
+    const flushing = this.flush();
+    // The barrier must never reject: tick() and stop() await it.
+    this.inFlight = flushing.then(
+      () => undefined,
+      () => undefined,
+    );
+
+    // Flush even when the loop was already stopped. A stopped engine can still
+    // hold dirty state — an external update absorbed while stopped, or a
+    // checkpoint whose write failed — and returning early here would drop it on
+    // the floor at shutdown, where there is no later checkpoint to retry it.
+    let flushed = 0;
+    try {
+      flushed = await flushing;
+    } finally {
+      this.inFlight = null;
+    }
+
+    if (wasRunning) {
+      logger.info(`Simulation stopped: ${this.live.size} truck(s), ${flushed} snapshot(s) flushed`);
+    } else {
+      logger.debug(`Simulation stop() called while not running; ${flushed} snapshot(s) flushed`);
+    }
   }
 
   /**
@@ -295,16 +346,27 @@ export class SimulationManager {
   }
 
   private async runTick(nowMs: number): Promise<void> {
-    try {
-      const now = new Date(nowMs);
+    const now = new Date(nowMs);
 
-      for (const tracked of this.tracked()) {
+    // Per truck, not per tick: one unusable truck must not silence the rest of
+    // the fleet for that interval. `lastTickAt` is advanced inside advanceOne
+    // before anything can throw, so a failure costs events, never distance.
+    let failure: string | null = null;
+
+    for (const tracked of this.tracked()) {
+      try {
         await this.advanceOne(tracked, now, nowMs);
+      } catch (error) {
+        // A failed truck must never kill the interval.
+        logger.error(`Simulation tick failed for ${tracked.state.reference}`, error);
+        failure = `${tracked.state.reference}: ${error instanceof Error ? error.message : String(error)}`;
       }
-    } catch (error) {
-      // A failed tick must never kill the interval.
-      logger.error('Simulation tick failed', error);
     }
+
+    this.lastTickAtMs = nowMs;
+    // Cleared by the first clean tick, so the field reads as "is it broken now",
+    // not "has it ever been broken".
+    this.lastTickError = failure;
   }
 
   // --- Delay scenarios (CLAUDE.md §7) --------------------------------------
@@ -551,6 +613,13 @@ export class SimulationManager {
       await this.inFlight;
     }
 
+    // Deliberately *not* gated on the loop running. `stop()` does not clear
+    // `live`, and `start()` only reloads when the map is empty, so bailing here
+    // would send the handler down its direct-Prisma branch and leave memory
+    // disagreeing with the row it just wrote — and the next start would resume
+    // from the stale snapshot and persist it back over the arrival. A WMS fact
+    // is true whether or not the engine happens to be ticking, so it is
+    // absorbed either way; the barrier above is what keeps it clear of a flush.
     const run = this.runExternalUpdate(idOrReference, update, reason);
     // The barrier tick() and stop() await must never reject.
     this.inFlight = run.then(
@@ -712,6 +781,11 @@ export class SimulationManager {
   private async advanceOne(tracked: TrackedTruck, now: Date, nowMs: number): Promise<void> {
     const { state, profile, lastTickAt } = tracked;
 
+    // Stamped before anything can throw: `elapsedMs` is already captured above,
+    // and a truck whose advance fails must not be billed twice for the same
+    // interval on the next tick (see the per-truck catch in runTick).
+    this.lastTickAt.set(state.truckId, nowMs);
+
     const result = advanceTruck({
       state,
       profile,
@@ -721,7 +795,6 @@ export class SimulationManager {
       arrivingProgress: this.deps.arrivingProgress,
     });
 
-    this.lastTickAt.set(state.truckId, nowMs);
     if (!result.moved) return;
 
     const next = result.state;

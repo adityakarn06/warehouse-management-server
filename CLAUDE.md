@@ -61,6 +61,15 @@ Tests are Vitest in `tests/`, split by what they touch:
   against a recording `RealtimeEmitter`, the simulation→sink seam driving the real
   engine with a fake store, and an end-to-end test with two real `socket.io-client`
   connections against a server on an ephemeral port.
+- `integration.test.ts` — the Phase 10 end-to-end suite, and the only one that
+  cuts **no** seam: the seeded database, a real `createApp()`, a real Socket.IO
+  server on an ephemeral port and real `socket.io-client` connections, all at
+  once. It sets up by hand the two things `server.ts` normally does
+  (`initWebsocket` and `simulationManager.setSink(realtimeSimulationSink())`),
+  leaves the docking and WMS sinks at their realtime defaults on purpose, drives
+  `manager.tick()` rather than waiting on timers, and restores **both** the yard
+  and the fleet — plus `simulationManager.reset()`, because the live store is the
+  other half of the world and survives a `stop()`.
 
 **Re-seed before `pnpm test` if `pnpm dev` has been running.** Autostart moves the
 same rows `read-api.test.ts` asserts on, so a long dev session will eventually
@@ -78,7 +87,7 @@ config via `import { env } from './config/index.js'`, never `process.env`
 
 ## Current state
 
-**Phases 1–9 are done.**
+**Phases 1–10 are done. The backend is feature-complete.**
 
 Phase 1 (foundation): config, logger, Prisma client, error handling,
 `/health` + `/api/v1/health` + `/api/v1/health/db`, bare Socket.IO server.
@@ -166,8 +175,8 @@ nothing is broadcast to a socket that did not ask. Events go out **by name**
 in Phase 8, and `ALERT_CREATED` in Phase 6 — every event in the contract now has
 a writer.
 
-Full reference with example payloads: `api-docs/api.md`, and
-`api-docs/realtime.md` for the Socket.IO contract.
+Full reference with example payloads: `docs/api.md`, and
+`docs/realtime.md` for the Socket.IO contract.
 
 Phase 6 (ETA + delay scenarios): the operator can now slow a truck down.
 
@@ -252,6 +261,52 @@ reuses the seven in §13 and the enum members Phases 1-8 left unowned
 (supertest, self-restoring) and an `external updates` suite in
 `tests/simulation.test.ts`. No new env vars.
 
+Phase 10 (integration hardening, tests, docs): no new features — the phase was
+about making the system stable and consumable by a frontend.
+
+```text
+src/docking/dock-lock.ts     the yard-wide async mutex
+src/lib/shutdown-state.ts    beginShutdown()/isShuttingDown() — the command gate
+tests/integration.test.ts    the end-to-end suite (real DB + HTTP + Socket.IO)
+docs/architecture.md         the layer diagram and the decisions behind it
+```
+
+Six audit fixes, all narrow:
+
+1. `uncaughtException` exited **0**, telling a supervisor a crash was a clean
+   exit. `shutdown()` now takes an exit code.
+2. Shutdown stopped the simulation *before* closing the HTTP listener, so a
+   `POST /simulation/start` arriving in that window installed a fresh interval
+   that then ticked into a disconnecting Prisma client. The listener now closes
+   first — but is **awaited last**, because Socket.IO's live upgrades keep
+   `close()` from resolving until `closeWebsocket()` has disconnected them.
+3. `applyExternalUpdate` could claim the `inFlight` barrier the instant
+   `runStop` released it, persisting after the flush. `runStop` now **holds the
+   barrier across its own flush** rather than releasing it first, and flushes
+   unconditionally, so a stopped-but-dirty world is still written.
+4. `runTick` wrapped the whole fleet loop in one try/catch, so one bad truck
+   silenced the rest for that tick. The catch is per truck now, and
+   `lastTickAt` is stamped before anything can throw.
+5. Two concurrent `assignDock` calls for the same door both passed
+   `dockStillTakes` under READ COMMITTED and both committed — see the yard lock
+   below. `releaseDock` also judged `UNAVAILABLE` off a read taken *outside* its
+   transaction; it re-reads the door inside now.
+6. `patchDockStatus` / `postDockRelease` let each service call `new Date()`
+   separately, stamping one operator action milliseconds apart.
+
+`GET /api/v1/simulation/state` and the three lifecycle endpoints now also carry
+`lastTickAt` and `lastTickError`. Docs moved from `api-docs/` to `docs/`.
+
+**No linter is configured.** `typescript-eslint` hard-refuses TypeScript 7
+(upstream issue #10940) and this project is on `typescript@7.0.2`; pinning TS 6
+for ESLint alone does not work, because the peer resolves to the root's TS 7.
+The strict tsconfig plus the three typecheck configs are the gate instead. The
+one pass that did run under a temporary TS 6 found two real issues, both fixed:
+a floating promise in `closeWebsocket` (`server.close()` returns a promise *and*
+takes a callback — it is awaited directly now, which surfaces a close error the
+callback form dropped) and the `console.error` in `env.ts`, which turned out to
+be necessary since `logger` reads its level from that very module.
+
 Still empty placeholder directory: `src/alerts` (alert logic lives in
 `src/services/alert-service.ts`).
 Sections 15, 24 and 27–31 below describe the target system, not the code on disk.
@@ -332,7 +387,7 @@ Sections 15, 24 and 27–31 below describe the target system, not the code on di
   payload as the single argument. The `{ type, data }` form exists only inside the
   process as `RealtimeEvent`, the tagged union `RealtimeService.emit()` routes on.
   Adding an event means a member in `src/websocket/events.ts`, a case in
-  `roomsFor()`, and a row in `api-docs/realtime.md` — nothing else.
+  `roomsFor()`, and a row in `docs/realtime.md` — nothing else.
 - **Nothing crosses the wire as a `Date`.** Socket.IO JSON-serialises acks, so
   snapshots are wire-shaped: `LiveTruckWireView` = `Wire<LiveTruckView>` and
   `snapshots.ts` stringifies the timestamps itself rather than letting the
@@ -565,6 +620,71 @@ Sections 15, 24 and 27–31 below describe the target system, not the code on di
   appointments and location history, and `read-api.test.ts` asserts exact seeded
   values. `snapshotFleet`/`restoreFleet` in `tests/docking-fixtures.ts` close
   that gap.
+
+- **One yard lock, not one per door.** `withYardLock` in
+  `src/docking/dock-lock.ts` serialises `assignDock`, `reassignDock` and
+  `releaseDock` against each other. Per-door keys would be marginally more
+  parallel, but `reassignDock` does not know which door it will land on until it
+  has walked the ranking *inside* its transaction, so it has no key to take — and
+  a mix of yard-wide and per-door keys would not exclude each other. It is **not
+  re-entrant**: `handleDockFailure` deliberately stays outside it, because it
+  loops over trucks calling `reassignDock` and would deadlock on the first one.
+  The guarantee is process-local, which is complete for §3; `docs/architecture.md`
+  names the exclusion constraint a second process would need.
+- **`runStop` holds the barrier across its own flush.** Draining `inFlight` and
+  *then* flushing leaves a gap: a command parked in `applyExternalUpdate`'s own
+  `while (this.inFlight !== null)` loop claims the slot the instant the drain
+  resolves and persists behind the flush. Assigning the flush promise to
+  `inFlight` with nothing awaited in between closes it — the same claim-without-
+  awaiting pattern `changeDelay` relies on. It also flushes when the loop was
+  never running: a stopped engine can still hold dirty state, and at shutdown
+  there is no later checkpoint to retry it.
+- **`applyExternalUpdate` is deliberately *not* gated on the loop running.** A
+  first pass at the barrier problem refused external updates whenever the engine
+  was stopped, which was worse than the bug: `stop()` does not clear `live` and
+  `start()` only reloads when the map is empty, so the WMS handler fell through
+  to its direct-Prisma branch and left memory saying `IN_TRANSIT` over a row
+  saying `ARRIVED` — and the next start resumed from the stale snapshot and
+  persisted it back over the arrival. A WMS fact is absorbed whether or not the
+  engine is ticking. `tests/integration.test.ts` pins this.
+- **The HTTP listener closes first but is awaited last — and that is the coarse
+  gate, not the guarantee.** Awaiting it early would deadlock, because
+  Socket.IO's connections are live upgrades that `closeIdleConnections()` does
+  not touch and `close()` waits on until `closeWebsocket()` disconnects them.
+  But `close()` only refuses *new connections*: a client already holding a
+  keep-alive can still land a `POST /simulation/start` after the loop has
+  stopped and flushed. `beginShutdown()` in `src/lib/shutdown-state.ts` is what
+  actually closes that — a middleware in `app.ts` 503s every non-GET once
+  shutdown begins. Reads stay open; they cannot restart anything.
+- **`httpClosed` is owned from the moment it is created.** It is declared
+  outside the `try` and given a `.catch()` immediately, because a throw from
+  `stop()` or `closeWebsocket()` jumps to the catch and never awaits it — and a
+  rejection from `close()` would then surface as an unowned `unhandledRejection`
+  after the process had already logged a different shutdown error.
+- **`releaseDock` compares against the status it read *inside* the
+  transaction.** Emitting off `findDock`'s earlier snapshot would announce an
+  `AVAILABLE -> UNAVAILABLE` transition the release never made, and that
+  `setDockStatus` had already broadcast, whenever the door went down in between.
+- **`server.close()` in socket.io never rejects.** It hands any error to the
+  callback and then resolves unconditionally, so awaiting the promise does not
+  observe a close failure. Acceptable on the shutdown path, where
+  `httpServer.close()` reports the same failure a moment later — but do not read
+  the `await` as error handling.
+- **A tick failure is per truck, and visible.** The catch moved inside the fleet
+  loop so one unusable truck cannot silence the others, and `lastTickAt` is
+  stamped before `advanceTruck` runs so a failure costs events, never distance.
+  Because the failure is swallowed, `health()` surfaces `lastTickError` —
+  otherwise a wedged engine looks identical to a healthy one from outside. It is
+  cleared by the first clean tick: the field means "is it broken now".
+- **`tests/integration.test.ts` resets the simulation manager, not just the
+  database.** `LiveStateStore` is the source of truth between writes and survives
+  a `stop()`, so a truck one test delayed is still `DELAYED` in memory for the
+  next one — and `start()` only reloads when the map is empty. `reset()` on a
+  stopped engine reloads from the rows `restoreFleet` just put back.
+- **The integration suite deliberately leaves the docking and WMS sinks at their
+  realtime defaults.** Every other DB suite swaps in a `RecordingSink`; this one
+  exists to prove the wiring those swaps replace, so it asserts on what a real
+  `socket.io-client` receives instead.
 
 ---
 
@@ -1487,9 +1607,10 @@ prisma/
   schema.prisma
   seed.ts
 
-api-docs/
+docs/
   architecture.md
   api.md
+  realtime.md
 ```
 
 The exact folder structure can evolve if there is a good reason, but keep responsibilities separated.

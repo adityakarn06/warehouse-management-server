@@ -1,7 +1,29 @@
-# E2 Backend — REST API (Phases 3–9: read APIs, simulation control, docking, WMS feed)
+# E2 Backend — REST API
 
 Base URL: `http://localhost:4000`
 All domain endpoints live under `/api/v1`.
+
+Companion documents: **`realtime.md`** for the Socket.IO contract, and
+**`architecture.md`** for how the pieces fit together and why.
+
+## For frontend developers — the short version
+
+1. **The backend is the source of truth.** Truck position, progress, speed, ETA,
+   status, delay scenario, dock availability, assignments, reassignments and
+   alerts are all decided here. The frontend asks for an action, subscribes, and
+   renders. It never picks a replacement dock or computes an ETA itself.
+2. **Read state over REST, follow it over Socket.IO.** Load a page with a `GET`,
+   then subscribe to the rooms you care about; every subsequent change arrives as
+   an event. Do not poll — alerts especially.
+3. **Positions arrive every ~2 seconds; you interpolate between them.** Each
+   `TRUCK_POSITION_UPDATED` carries `targetLatitude`/`targetLongitude` — where
+   the truck will be at the *next* tick — precisely so you can animate towards it.
+   See `architecture.md`.
+4. **Every command answers with the resulting state.** A delay, an assignment or
+   a dock failure returns what the backend decided, so you never need a
+   follow-up `GET` to find out what happened.
+5. **`sequenceNumber` is your high-water mark.** Drop any truck update whose
+   sequence is below the last one you applied; it survives a simulation reset.
 
 ## Conventions
 
@@ -27,8 +49,10 @@ issue list.
 | Status | When |
 | --- | --- |
 | `200` | Success |
-| `400` | Query/route parameter failed Zod validation |
+| `201` | A dock assignment was created |
+| `400` | Body, query or route parameter failed Zod validation; or a command the domain refuses outright (an incompatible dock, an unknown delay scenario) |
 | `404` | Unknown resource, or unknown route |
+| `409` | The command conflicts with current state — the door was taken in between, the loop is not running, a trailer is not docked where the feed says |
 | `500` | Unhandled error (message hidden in production) |
 | `503` | `/api/v1/health/db` only — database unreachable |
 
@@ -445,8 +469,23 @@ ARRIVED`. The loop starts on server boot unless `SIMULATION_AUTOSTART=false`
 The three lifecycle endpoints return the same shape:
 
 ```json
-{ "data": { "running": true, "truckCount": 9, "tickMs": 2000 } }
+{
+  "data": {
+    "running": true,
+    "truckCount": 9,
+    "tickMs": 2000,
+    "lastTickAt": "2026-08-26T15:15:22.401Z",
+    "lastTickError": null
+  }
+}
 ```
+
+`lastTickAt` and `lastTickError` are the loop's health. A per-truck tick failure
+is logged and swallowed so one bad truck cannot kill the interval, which would
+otherwise make a wedged engine indistinguishable from a healthy one from
+outside. `lastTickError` names the most recent failing truck and is cleared by
+the first clean tick after it — it reads as "is it broken now", not "has it ever
+been broken".
 
 `GET /api/v1/simulation/trucks/TRK-101`:
 

@@ -26,7 +26,11 @@ export async function getDock(req: Request, res: Response): Promise<void> {
 export async function patchDockStatus(req: Request, res: Response): Promise<void> {
   const { id } = parseParams(idParamSchema, req);
   const { status, reason } = parseBody(dockStatusCommandSchema, req);
-  sendData(res, await setDockStatus(id, status, reason));
+  // One clock for the whole request. Without it the status write, the alert and
+  // every reassignment the cascade makes each call `new Date()` separately, so
+  // the timeline a dashboard renders is stamped milliseconds apart for what was
+  // one operator action.
+  sendData(res, await setDockStatus(id, status, reason, new Date()));
 }
 
 /**
@@ -36,5 +40,5 @@ export async function patchDockStatus(req: Request, res: Response): Promise<void
  */
 export async function postDockRelease(req: Request, res: Response): Promise<void> {
   const { id } = parseParams(idParamSchema, req);
-  sendData(res, await releaseDock(id));
+  sendData(res, await releaseDock(id, new Date()));
 }

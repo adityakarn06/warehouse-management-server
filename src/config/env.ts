@@ -67,6 +67,10 @@ if (!parsed.success) {
   const issues = parsed.error.issues
     .map((issue) => `  - ${issue.path.join('.') || '(root)'}: ${issue.message}`)
     .join('\n');
+  // The one place `console` is correct: `logger` reads its level from this very
+  // module, so importing it here would be circular — and a process that cannot
+  // parse its own configuration has to be able to say so before it exits.
+  // eslint-disable-next-line no-console
   console.error(`Invalid environment configuration:\n${issues}`);
   process.exit(1);
 }
