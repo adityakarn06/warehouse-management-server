@@ -13,6 +13,10 @@ pnpm build                   # prisma generate && tsc
 pnpm start                   # node dist/server.js
 pnpm typecheck               # tsc --noEmit — run this after every change
 pnpm typecheck:seed          # tsc -p tsconfig.seed.json — covers prisma/seed.ts
+pnpm typecheck:test          # tsc -p tsconfig.test.json — covers tests/
+pnpm test                    # vitest run — integration tests against the seeded db
+pnpm test:watch              # vitest
+pnpm vitest run -t "yard"    # single test / suite by name
 pnpm prisma:migrate          # prisma migrate dev
 pnpm prisma:generate         # regenerates the client into src/generated/prisma
 
@@ -28,18 +32,21 @@ pnpm db:studio               # prisma studio
 because its `rootDir` is `./src`. Run `pnpm typecheck:seed` after touching the
 seed.
 
-No test runner is configured yet. When the first tests land, wire one up
-(and add `test` / single-test invocation here) rather than leaving §23 aspirational.
+Tests are Vitest + supertest in `tests/`, driving `createApp()` in-process (no
+port bound). They run **against the seeded development database** and are
+read-only, so `pnpm db:seed` must have run first. `tests/` sits outside the root
+`rootDir`, hence the separate `tsconfig.test.json`.
 
 Environment: copy `.env.example` to `.env`. `DATABASE_URL` is the only
-required variable; everything else has a default. `src/config/env.ts` parses
+required variable; everything else has a default (`ARRIVAL_HORIZON_MINUTES`,
+default 120, controls the yard overview's upcoming-arrivals window). `src/config/env.ts` parses
 `process.env` through Zod once and `process.exit(1)`s on invalid config — read
 config via `import { env } from './config/index.js'`, never `process.env`
 (the one exception is `prisma/seed.ts`, which runs outside the app).
 
 ## Current state
 
-**Phases 1–2 are done.**
+**Phases 1–3 are done.**
 
 Phase 1 (foundation): config, logger, Prisma client, error handling,
 `/health` + `/api/v1/health` + `/api/v1/health/db`, bare Socket.IO server.
@@ -63,9 +70,29 @@ hour, so the demo is byte-identical in shape on every run but always sits around
 D4 as the compatible replacement (Scenario D), and SHP-1009 oversized with the
 only oversized door D6 occupied (Scenario E).
 
-Still empty placeholder directories: `src/services`, `src/simulation`,
-`src/eta`, `src/docking`, `src/alerts`, `src/wms`. Sections 4–16 and 18–31 below
-describe the target system, not the code on disk.
+Phase 3 (read APIs): every `GET` in §16 except the simulation/WMS ones, wired
+onto `apiV1Router`:
+
+```text
+/api/v1/shipments              ?status &priority &loadType &limit &offset
+/api/v1/shipments/:id
+/api/v1/shipments/reference/:reference
+/api/v1/tracking/:trackingNumber
+/api/v1/trucks                 ?status &routeId &activeDelay &limit &offset
+/api/v1/trucks/:id
+/api/v1/routes/:id
+/api/v1/docks                  ?status &zone &loadType &limit &offset
+/api/v1/docks/:id
+/api/v1/dock-assignments       ?status &truckId &dockDoorId &shipmentId &limit &offset
+/api/v1/alerts                 ?type &severity &acknowledged &truckId &shipmentId &dockDoorId
+/api/v1/yard/overview
+```
+
+Full reference with example payloads: `docs/api.md`.
+
+Still empty placeholder directories: `src/simulation`, `src/eta`, `src/docking`,
+`src/alerts`, `src/wms`. Sections 4–15, 22, 24–25 and 27–31 below describe the
+target system, not the code on disk.
 
 ## Conventions that are easy to get wrong
 
@@ -81,6 +108,28 @@ describe the target system, not the code on disk.
   `noUnusedLocals`/`Parameters` are all on. Notably, an optional property must be
   omitted rather than set to `undefined` (see the `details` handling in
   `src/lib/http-error.ts`).
+- **Success envelope.** Every 2xx body is `{ data }`, and list endpoints add
+  `{ meta: { total, limit, offset } }`. Build it through `sendData` / `sendList`
+  in `src/lib/api-response.ts` rather than calling `res.json` directly. The
+  health endpoints predate this and stay unenveloped on purpose.
+- **Validation.** Query and route params go through Zod schemas in
+  `src/schemas/`, applied with `parseQuery` / `parseParams` from
+  `src/lib/validate.ts`, which turns a `ZodError` into a 400 carrying
+  `error.details`. Note `z.coerce.boolean()` is a trap (any non-empty string is
+  `true`) — use the `booleanQuery` schema in `src/schemas/common.ts`.
+- **Prisma selects.** Shared `select` fragments live in `src/services/selects.ts`
+  as `as const` objects. Filter arrays (`{ in: [...] }`) must **not** be inside
+  an `as const` literal — Prisma rejects `readonly` arrays, which is why
+  `activeAssignmentWhere` is declared separately.
+- **`Route.geometry` is returned by `GET /api/v1/routes/:id` only.** No other
+  endpoint may select it (§24).
+- **Detail lookups accept id or natural key.** Seeded rows use their human
+  reference as the primary key but runtime rows get a `cuid()`, so
+  `getTruckById` and friends try `id`, then `reference`/`code`, then 404.
+- **Optional filters + `exactOptionalPropertyTypes`.** Zod `.optional()` yields
+  `T | undefined`, so filter interfaces must declare `status?: T | undefined`,
+  and `where` objects are built through `compact()` in `src/lib/object.ts`,
+  which strips undefined keys.
 - **Errors.** Throw `HttpError.badRequest/notFound/internal` from
   `src/lib/http-error.ts`; the central `errorHandler` renders
   `{ error: { message, status, details? } }` and hides messages in production.
@@ -91,7 +140,9 @@ describe the target system, not the code on disk.
   handlers), `src/middleware/` (cross-cutting). A route file should contain
   `router.get(path, controllerFn)` lines and nothing else; put the logic in a
   controller, and anything non-trivial in a service under `src/services/`.
-- **Wiring.** `createApp()` in `src/app.ts` builds the Express app; `src/server.ts`
+- **Wiring.** `createApp()` in `src/app.ts` builds the Express app (with
+  `requestLogger` from `src/middleware/request-logger.ts` in front of the
+  routers); `src/server.ts`
   owns the HTTP server, Socket.IO init, and graceful shutdown. New domain routers
   mount on `apiV1Router` in `src/routes/index.ts`. Note `/health` is registered
   twice on purpose — top-level in `app.ts` and under `/api/v1` via the router —
@@ -1118,6 +1169,9 @@ exit
 ---
 
 # 23. Testing
+
+Runner: **Vitest + supertest** (`pnpm test`), suites in `tests/`. Phase 3 landed
+`tests/read-api.test.ts` covering the read APIs against the seeded database.
 
 Prioritize tests around business logic rather than testing every trivial getter.
 

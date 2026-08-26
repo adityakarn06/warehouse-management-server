@@ -20,3 +20,5 @@ export interface ErrorResponse {
     details?: unknown;
   };
 }
+
+export * from './api.js';

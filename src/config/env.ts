@@ -12,6 +12,9 @@ const envSchema = z.object({
   CORS_ORIGIN: z.string().default('*'),
 
   SHUTDOWN_TIMEOUT_MS: z.coerce.number().int().positive().default(10_000),
+
+  /** How far ahead the yard overview looks when listing upcoming arrivals. */
+  ARRIVAL_HORIZON_MINUTES: z.coerce.number().int().positive().default(120),
 });
 
 const parsed = envSchema.safeParse(process.env);
