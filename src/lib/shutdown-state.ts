@@ -27,3 +27,13 @@ export function beginShutdown(): void {
 export function isShuttingDown(): boolean {
   return shuttingDown;
 }
+
+/**
+ * Test seam, in the same spirit as `resetDockingSink()`. The flag is
+ * module-global and one-way by design — a real process never comes back — so a
+ * test that exercises the gate has to be able to put it back for the tests after
+ * it. Nothing in `src/` calls this.
+ */
+export function resetShutdownState(): void {
+  shuttingDown = false;
+}

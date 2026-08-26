@@ -7,6 +7,7 @@ import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
 import { createApp } from '../src/app.js';
 import { yardLockIdle } from '../src/docking/dock-lock.js';
 import { disconnectPrisma, prisma } from '../src/lib/prisma.js';
+import { beginShutdown, resetShutdownState } from '../src/lib/shutdown-state.js';
 import { simulationManager } from '../src/simulation/simulation-manager.js';
 import type {
   ClientToServerEvents,
@@ -702,6 +703,30 @@ describe('releasing a door that is out of service', () => {
     // ...and the release must not re-announce the outage `setDockStatus` already
     // broadcast.
     expect(only(seen, 'DOCK_STATUS_CHANGED')).toHaveLength(0);
+  });
+});
+
+describe('the shutdown command gate', () => {
+  afterEach(() => resetShutdownState());
+
+  it('refuses commands but keeps answering reads once shutdown begins', async () => {
+    // `httpServer.close()` only refuses new *connections*; a client already
+    // holding a keep-alive can still land one more request. If that request were
+    // `POST /simulation/start` it would install a fresh interval after the loop
+    // had stopped and flushed. This is the gate that actually prevents it.
+    await request(app).post('/api/v1/simulation/start').expect(200);
+
+    beginShutdown();
+
+    await request(app).post('/api/v1/simulation/start').expect(503);
+    await request(app)
+      .patch('/api/v1/docks/D2/status')
+      .send({ status: 'UNAVAILABLE' })
+      .expect(503);
+
+    // Reads are harmless on the way down and stay open.
+    await request(app).get('/api/v1/trucks/TRK-101').expect(200);
+    await request(app).get('/health').expect(200);
   });
 });
 
