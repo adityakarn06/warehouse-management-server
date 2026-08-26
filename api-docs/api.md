@@ -147,6 +147,7 @@ Returns the full route **including `geometry`** — an array of
 | `GET` | `/api/v1/docks` | `status`, `zone`, `loadType`, `limit`, `offset` |
 | `GET` | `/api/v1/docks/:id` | — |
 | `PATCH` | `/api/v1/docks/:id/status` | — (JSON body) |
+| `POST` | `/api/v1/docks/:id/release` | — |
 
 - `status`: `AVAILABLE` `RESERVED` `OCCUPIED` `UNAVAILABLE`
 - `loadType` matches against the dock's `supportedLoadTypes` list.
@@ -157,7 +158,7 @@ occupied. Assignment history on the detail route is capped at the 20 most recent
 Detail rows include the full assignment history and the dock's unacknowledged
 alerts.
 
-#### `PATCH /api/v1/docks/:dockId/status` (Phase 7)
+#### `PATCH /api/v1/docks/:dockId/status` (Phase 7, cascade in Phase 8)
 
 The operator's two buttons — "make unavailable" and "make available". The
 frontend sends a status and nothing else; the backend owns every consequence
@@ -185,7 +186,24 @@ frontend sends a status and nothing else; the backend owns every consequence
         "shipmentId": "SHP-1001",
         "truck": { "id": "TRK-101", "reference": "TRK-101", "status": "IN_TRANSIT", "eta": "..." } }
     ],
-    "alert": { "alertId": "clx...", "type": "DOCK_UNAVAILABLE", "severity": "WARNING", /* ... */ }
+    "alert": { "alertId": "clx...", "type": "DOCK_UNAVAILABLE", "severity": "WARNING", /* ... */ },
+    "reassignments": [
+      {
+        "truckId": "TRK-101",
+        "truckReference": "TRK-101",
+        "shipmentId": "SHP-1001",
+        "outcome": "REASSIGNED",
+        "previousAssignmentId": "DA-3002",
+        "previousDockDoorId": "D2",
+        "previousDockCode": "D2",
+        "newAssignmentId": "clx...",
+        "newDockDoorId": "D4",
+        "newDockCode": "D4",
+        "score": 87,
+        "reasons": ["Compatible with refrigerated load", "Available before ETA", "..."],
+        "alert": { "alertId": "clx...", "type": "DOCK_REASSIGNMENT", "severity": "INFO", /* ... */ }
+      }
+    ]
   }
 }
 ```
@@ -195,13 +213,56 @@ Notes on behaviour:
 - Pressing the same button twice is a **no-op success**: `changed: false`, the
   current state is returned and nothing is emitted.
 - Taking down a door that still holds an `ASSIGNED` row reports it in
-  `affectedAssignments` and raises one `DOCK_UNAVAILABLE` alert naming the
-  stranded trucks. **Phase 7 stops there** — the assignment is left in place and
-  no replacement is chosen. Automatic reassignment is Phase 8 (§10).
+  `affectedAssignments`, raises one `DOCK_UNAVAILABLE` alert naming the affected
+  trucks, and then **runs the failure cascade** (§10): each of those trucks is
+  re-scored against every remaining door and moved, or reported as having
+  nowhere to go. `affectedAssignments` describes the door as it was *before* the
+  cascade; `reassignments` says where each truck ended up.
+- `outcome: "REASSIGNED"` — the old row becomes `REASSIGNED` (`reassignedAt`
+  stamped, `releasedAt` left null) and the new row points back at it through
+  `previousAssignmentId`. The replacement door flips `AVAILABLE → RESERVED`.
+- `outcome: "NO_DOCK_AVAILABLE"` — no dock is invented (§10). The old row is
+  `CANCELLED`, the truck is left genuinely unassigned, and a `CRITICAL`
+  `NO_DOCK_AVAILABLE` alert carries the scorer's own exclusion sentences in
+  `metadata.excluded` so the board can say *why* nothing fit.
+- `outcome: "REASSIGNMENT_FAILED"` — the move itself failed, so the truck is
+  still `ASSIGNED` to the door that just went down and needs a human. It gets a
+  `CRITICAL` alert of its own; it is never silently omitted from this array,
+  because "absent" would be indistinguishable from "never affected".
+- Trucks on a multi-booking door are handled earliest-slot-first, so the demo is
+  deterministic (§25). Each truck's move is its own transaction: one failing
+  must not roll back another's.
 - Putting a door back while a booking still holds it returns it to `RESERVED`,
-  not `AVAILABLE` — reporting a taken door as free would be a lie.
-- Emits `DOCK_STATUS_CHANGED`, plus `ALERT_CREATED` when an alert was raised. A
-  failed alert write is logged but never fails the command.
+  not `AVAILABLE` — reporting a taken door as free would be a lie. After the
+  cascade a repaired door is normally `AVAILABLE`, because its booking left with
+  the reassignment.
+- Emits `DOCK_STATUS_CHANGED` for every door whose status moved, `ALERT_CREATED`
+  per alert, and `DOCK_REASSIGNED` per truck that was moved. A failed alert
+  write is logged but never fails the command — the door is authoritatively down
+  and the truck authoritatively moved either way.
+- `404` on an unknown dock (id or `code`).
+
+#### `POST /api/v1/docks/:dockId/release` (Phase 8)
+
+Hands a door back to the yard. Every committed assignment on it becomes
+`COMPLETED` with `releasedAt` stamped, and the door returns to `AVAILABLE` with
+`availableFrom` cleared.
+
+```jsonc
+// response
+{
+  "data": {
+    "dockDoorId": "D4",
+    "dockCode": "D4",
+    "status": "AVAILABLE",
+    "releasedAssignmentIds": ["clx..."]
+  }
+}
+```
+
+- A door that is `UNAVAILABLE` stays `UNAVAILABLE`: releasing a booking does not
+  repair a broken dock. The response carries the *resulting* status either way.
+- Emits `DOCK_STATUS_CHANGED` only when the status actually moved.
 - `404` on an unknown dock (id or `code`).
 
 ### Dock recommendations and assignment (Phase 7)
@@ -292,11 +353,15 @@ Notes on behaviour:
   (`"Dock D3 cannot take TRK-101: Does not support REFRIGERATED loads"`). The
   backend is the source of truth (§2), so this cannot be overridden.
 - `404` on an unknown truck or dock; `409` when no compatible dock exists and no
-  dock was named. We never invent a dock (§10) — Phase 8 turns this case into a
-  `NO_DOCK_AVAILABLE` alert.
-- Moving a truck cancels its previous row (`CANCELLED`, `releasedAt`) and frees
-  that door. `REASSIGNED` + `previousAssignmentId` is deliberately **not** used
-  here: that chain is reserved for Phase 8's dock-failure path.
+  dock was named, or when the door stopped being usable between scoring and
+  committing — taken by another truck, or taken out of service. We never invent a dock (§10) — on the *failure* path the same
+  situation becomes a `NO_DOCK_AVAILABLE` alert instead of an error, because
+  nobody pressed a button to be told no.
+- Moving a truck by hand cancels its previous row (`CANCELLED`, `releasedAt`)
+  and frees that door. `REASSIGNED` + `previousAssignmentId` is deliberately
+  **not** used here: that chain belongs to the dock-failure path, so the
+  timeline distinguishes "operations moved this truck" from "the yard forced
+  this truck to move".
 - Committing a dock flips it `AVAILABLE → RESERVED` with
   `availableFrom = scheduledEnd`. `OCCUPIED` is the WMS's transition (Phase 9),
   when a truck has physically backed in.
@@ -584,4 +649,24 @@ curl -s -X PATCH http://localhost:4000/api/v1/docks/D2/status \
 
 # Scenario E — the only oversized door is occupied, so nothing is recommended
 curl -s http://localhost:4000/api/v1/trucks/TRK-109/dock-recommendations | jq '.data.excluded'
+
+# --- Dock failure and automatic reassignment (Phase 8) ---
+
+# Scenario D — take down the door TRK-101 is standing on. The *backend* picks D4.
+curl -s -X PATCH http://localhost:4000/api/v1/docks/D2/status \
+  -H 'Content-Type: application/json' \
+  -d '{"status":"UNAVAILABLE","reason":"Hydraulic fault"}' | jq '.data.reassignments'
+
+# The chain it wrote: DA-3002 REASSIGNED -> a new ASSIGNED row on D4
+curl -s 'http://localhost:4000/api/v1/dock-assignments?truckId=TRK-101' \
+  | jq '.data[] | {id, dockDoorId, status, previousAssignmentId}'
+
+# Scenario E — with D7 already down, dropping D4 too leaves the reefer nowhere to go
+curl -s -X PATCH http://localhost:4000/api/v1/docks/D4/status \
+  -H 'Content-Type: application/json' -d '{"status":"UNAVAILABLE"}' | jq '.data.reassignments'
+
+curl -s 'http://localhost:4000/api/v1/alerts?type=NO_DOCK_AVAILABLE' | jq '.data[0]'
+
+# Hand a door back to the yard
+curl -s -X POST http://localhost:4000/api/v1/docks/D4/release | jq
 ```

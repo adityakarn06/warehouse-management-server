@@ -1,4 +1,5 @@
 import { env } from '../config/index.js';
+import type { Prisma } from '../generated/prisma/client.js';
 import type {
   AssignmentStatus,
   DockStatus,
@@ -9,7 +10,7 @@ import type {
 import { HttpError } from '../lib/http-error.js';
 import { prisma } from '../lib/prisma.js';
 import { assignmentRecencyOrder, committedAssignmentWhere } from '../services/selects.js';
-import { dockingSink, dockStatusChangedEvent } from './docking-events.js';
+import { dockingSink, dockReassignedEvent, dockStatusChangedEvent } from './docking-events.js';
 import { scoreDocks } from './dock-scoring.js';
 import type { DockScore, ExcludedDock, ScoringContext, ScoringDock } from './dock-scoring.js';
 
@@ -21,8 +22,9 @@ import type { DockScore, ExcludedDock, ScoringContext, ScoringDock } from './doc
  * consequence of a recommendation being *taken*: the assignment rows, the dock
  * door's own status, and the realtime events that follow.
  *
- * `reassignDock()` is deliberately absent — automatic reassignment after a dock
- * failure is Phase 8, and a stub here would only pretend otherwise.
+ * Phase 8 added `reassignDock()`: the same engine, driven by a door going down
+ * rather than by an operator picking a dock. It is the only writer of the
+ * `REASSIGNED` + `previousAssignmentId` chain — a manual re-pick still cancels.
  */
 
 const MS_PER_MINUTE = 60_000;
@@ -129,11 +131,18 @@ function laterOf(a: Date, b: Date): Date {
   return a.getTime() >= b.getTime() ? a : b;
 }
 
+/** The window a truck is being committed to — shared by both write paths. */
+interface Slot {
+  start: Date;
+  end: Date;
+  minutes: number;
+}
+
 /**
  * The slot the truck is being scored for: it cannot start before it arrives,
  * and it cannot start before its booked window opens.
  */
-function slotFor(truck: TruckContext, now: Date): { start: Date; end: Date; minutes: number } {
+function slotFor(truck: TruckContext, now: Date): Slot {
   const appointment = truck.shipment?.appointment ?? null;
   const arrival = truck.eta ?? now;
   const start = appointment ? laterOf(arrival, appointment.windowStart) : arrival;
@@ -164,6 +173,90 @@ function toScoringDock(dock: DockCandidate, truckId: string): ScoringDock {
       .filter((row) => row.truckId !== truckId && row.scheduledStart && row.scheduledEnd)
       .map((row) => ({ start: row.scheduledStart as Date, end: row.scheduledEnd as Date })),
   };
+}
+
+/** Either the door still takes this truck, or the sentence saying why not. */
+type DoorRecheck = { ok: true; status: DockStatus } | { ok: false; reason: string };
+
+/**
+ * Can this door still take this truck, *right now, inside the transaction*?
+ *
+ * `scoreDocks` already ran the same two questions, but it ran them before the
+ * write: two operators pressing the button at the same moment would both see a
+ * free door, and a door can go out of service in between. Re-asking inside the
+ * transaction — against the door's live row, not the scoring snapshot — closes
+ * that window. Postgres runs READ COMMITTED, so this narrows the race rather
+ * than eliminating it; the only complete fix is an exclusion constraint, which
+ * is more migration than a hackathon demo needs (§26).
+ *
+ * The caller must reserve against the returned `status`, not the scored one:
+ * flipping a door that has since gone `UNAVAILABLE` to `RESERVED` would clear
+ * the fault from the board while leaving `unavailableReason` behind.
+ *
+ * The truck's own rows never count against it: it cannot double-book itself.
+ */
+async function dockStillTakes(
+  tx: Prisma.TransactionClient,
+  dockDoorId: string,
+  truckId: string,
+  slot: Slot,
+): Promise<DoorRecheck> {
+  const dock = await tx.dockDoor.findUnique({
+    where: { id: dockDoorId },
+    select: { status: true, unavailableReason: true },
+  });
+
+  if (!dock) {
+    return { ok: false, reason: 'the door no longer exists' };
+  }
+
+  if (dock.status === 'UNAVAILABLE') {
+    return {
+      ok: false,
+      reason: dock.unavailableReason
+        ? `it went out of service: ${dock.unavailableReason}`
+        : 'it went out of service',
+    };
+  }
+
+  const clashes = await tx.dockAssignment.count({
+    where: {
+      dockDoorId,
+      truckId: { not: truckId },
+      ...committedAssignmentWhere,
+      // A committed row with no scheduled window counts as a clash rather than
+      // as "no overlap": Prisma's comparisons never match NULL, so the naive
+      // overlap test would wave a windowless booking straight through.
+      OR: [
+        { scheduledStart: { lt: slot.end }, scheduledEnd: { gt: slot.start } },
+        { scheduledStart: null },
+        { scheduledEnd: null },
+      ],
+    },
+  });
+
+  if (clashes > 0) {
+    return { ok: false, reason: 'another truck was committed to it for this slot' };
+  }
+
+  return { ok: true, status: dock.status };
+}
+
+/**
+ * A door that just lost its bookings should not keep claiming it is busy until
+ * their old end time. Only nulls `availableFrom` when nothing committed is left.
+ */
+async function clearAvailabilityIfUnheld(
+  tx: Prisma.TransactionClient,
+  dockDoorId: string,
+): Promise<void> {
+  const stillHeld = await tx.dockAssignment.count({
+    where: { dockDoorId, ...committedAssignmentWhere },
+  });
+
+  if (stillHeld === 0) {
+    await tx.dockDoor.update({ where: { id: dockDoorId }, data: { availableFrom: null } });
+  }
 }
 
 export interface RecommendationTruckView {
@@ -201,7 +294,7 @@ export interface RecommendationResult {
   shipment: RecommendationShipmentView | null;
   appointment: RecommendationAppointmentView | null;
   /** The slot the docks were scored against: ETA vs appointment, plus dock time. */
-  requestedWindow: { start: Date; end: Date; minutes: number };
+  requestedWindow: Slot;
   currentAssignment: CurrentAssignmentView | null;
   recommendations: DockScore[];
   excluded: ExcludedDock[];
@@ -210,7 +303,7 @@ export interface RecommendationResult {
 interface LoadedContext {
   truck: TruckContext;
   ctx: ScoringContext;
-  slot: { start: Date; end: Date; minutes: number };
+  slot: Slot;
   docks: DockCandidate[];
   scored: { recommendations: DockScore[]; excluded: ExcludedDock[] };
   current: Awaited<ReturnType<typeof currentAssignmentFor>>;
@@ -369,7 +462,7 @@ export async function assignDock(
 
   // One transaction: superseding the old row, freeing its door, creating the
   // new row and reserving its door must not be observable half-done (§18).
-  const { assignment, freedDockStatus } = await prisma.$transaction(async (tx) => {
+  const { assignment, freedDockStatus, reserved } = await prisma.$transaction(async (tx) => {
     let freed: FreedDock | null = null;
 
     if (current) {
@@ -399,6 +492,15 @@ export async function assignDock(
       }
     }
 
+    // Scoring saw a free door, but that read happened before this write.
+    const recheck = await dockStillTakes(tx, chosen.dockId, truck.id, slot);
+
+    if (!recheck.ok) {
+      throw HttpError.conflict(
+        `Dock ${chosen.dockCode} can no longer take ${truck.reference}: ${recheck.reason} — ask for recommendations again`,
+      );
+    }
+
     const created = await tx.dockAssignment.create({
       data: {
         truckId: truck.id,
@@ -414,16 +516,19 @@ export async function assignDock(
       select: assignmentSelect,
     });
 
-    // AVAILABLE -> RESERVED. OCCUPIED is the WMS's transition (a truck that has
-    // physically backed in), so an already-occupied door keeps its status.
-    if (chosen.status === 'AVAILABLE') {
+    // AVAILABLE -> RESERVED, off the door's *live* status. OCCUPIED is the WMS's
+    // transition (a truck that has physically backed in), so an already-occupied
+    // door keeps its status.
+    const reserved = recheck.status === 'AVAILABLE';
+
+    if (reserved) {
       await tx.dockDoor.update({
         where: { id: chosen.dockId },
         data: { status: 'RESERVED', availableFrom: slot.end },
       });
     }
 
-    return { assignment: created, freedDockStatus: freed };
+    return { assignment: created, freedDockStatus: freed, reserved };
   });
 
   const sink = dockingSink();
@@ -443,7 +548,7 @@ export async function assignDock(
     );
   }
 
-  if (chosen.status === 'AVAILABLE') {
+  if (reserved) {
     sink.emit(
       dockStatusChangedEvent(
         { id: chosen.dockId, code: chosen.dockCode, status: 'RESERVED', unavailableReason: null },
@@ -535,5 +640,211 @@ export async function releaseDock(dockIdOrCode: string, now = new Date()): Promi
     dockCode: updated.code,
     status: updated.status,
     releasedAssignmentIds: held.map((row) => row.id),
+  };
+}
+
+// --- Reassignment after a dock failure (Phase 8) -----------------------
+
+export interface ReassignPrevious {
+  id: string;
+  dockDoorId: string;
+  dockCode: string;
+}
+
+export interface ReassignResult {
+  /** `REASSIGNED` when a replacement was found; `NO_DOCK_AVAILABLE` when not. */
+  outcome: 'REASSIGNED' | 'NO_DOCK_AVAILABLE';
+  truck: RecommendationTruckView;
+  shipmentId: string | null;
+  loadType: LoadType | null;
+  previous: ReassignPrevious;
+  /** The replacement row, or `null` when nothing compatible was left. */
+  assignment: Awaited<ReturnType<typeof currentAssignmentFor>>;
+  /** What the engine considered, so the alert can explain itself. */
+  candidates: DockScore[];
+  excluded: ExcludedDock[];
+}
+
+/**
+ * Moves a truck off a door that has just gone out of service.
+ *
+ * The caller (`dock-failure-service`) has already flipped the door to
+ * `UNAVAILABLE`, which means the engine excludes it from its own truck's
+ * candidates through the ordinary hard filter — there is no special case here
+ * for "the dock we are running away from".
+ *
+ * This is the **only** writer of the `REASSIGNED` + `previousAssignmentId`
+ * chain (seeded as DA-3005 -> DA-3006). A manual re-pick through `assignDock`
+ * cancels instead, so the timeline distinguishes "operations moved this truck"
+ * from "the yard forced this truck to move".
+ *
+ * When nothing fits we do not invent a dock (§10): the old row is `CANCELLED`
+ * and the truck is left genuinely unassigned rather than parked on a door that
+ * cannot open.
+ */
+export async function reassignDock(
+  truckIdOrReference: string,
+  previousAssignmentId: string,
+  reason: string,
+  now = new Date(),
+): Promise<ReassignResult> {
+  const previous = await prisma.dockAssignment.findUnique({
+    where: { id: previousAssignmentId },
+    select: assignmentSelect,
+  });
+
+  if (!previous) {
+    throw HttpError.notFound(`Dock assignment ${previousAssignmentId} was not found`);
+  }
+
+  const loaded = await loadContext(truckIdOrReference, now);
+  const { truck, slot, scored } = loaded;
+
+  const previousView: ReassignPrevious = {
+    id: previous.id,
+    dockDoorId: previous.dockDoorId,
+    dockCode: previous.dockDoor.code,
+  };
+
+  // One transaction per truck: superseding the old row, writing the
+  // replacement and reserving its door must not be observable half-done (§18).
+  // Deliberately *not* one transaction for the whole outage — one truck's move
+  // failing must not roll back another truck's successful one.
+  const committed = await prisma.$transaction(async (tx) => {
+    let chosen: DockScore | null = null;
+    let liveStatus: DockStatus | null = null;
+
+    // Walk the ranking rather than trusting `[0]`: a door that was free when we
+    // scored may have been committed to someone else — or have gone out of
+    // service itself — in between.
+    for (const candidate of scored.recommendations) {
+      const recheck = await dockStillTakes(tx, candidate.dockId, truck.id, slot);
+
+      if (recheck.ok) {
+        chosen = candidate;
+        liveStatus = recheck.status;
+        break;
+      }
+    }
+
+    if (!chosen) {
+      // Conditional on the row still being the committed one we read: a
+      // concurrent release or re-pick must win rather than be overwritten.
+      const cancelled = await tx.dockAssignment.updateMany({
+        where: { id: previous.id, truckId: truck.id, ...committedAssignmentWhere },
+        data: { status: 'CANCELLED', releasedAt: now },
+      });
+
+      if (cancelled.count === 0) {
+        throw HttpError.conflict(
+          `Assignment ${previous.id} is no longer the committed booking for ${truck.reference}`,
+        );
+      }
+
+      await clearAvailabilityIfUnheld(tx, previous.dockDoorId);
+
+      return { chosen: null, assignment: null, reserved: null };
+    }
+
+    // REASSIGNED keeps `releasedAt` null and stamps `reassignedAt` — the shape
+    // the seeded DA-3005 row documents. Same conditional guard as above, so a
+    // row that has since been released is never rewritten.
+    const superseded = await tx.dockAssignment.updateMany({
+      where: { id: previous.id, truckId: truck.id, ...committedAssignmentWhere },
+      data: { status: 'REASSIGNED', reassignedAt: now },
+    });
+
+    if (superseded.count === 0) {
+      throw HttpError.conflict(
+        `Assignment ${previous.id} is no longer the committed booking for ${truck.reference}`,
+      );
+    }
+
+    // The superseded row must already exist for the FK to resolve, which the
+    // update above guarantees. `previousAssignmentId` is unique, so a second
+    // failure chains forward from this new row, never re-points at the old one.
+    const created = await tx.dockAssignment.create({
+      data: {
+        truckId: truck.id,
+        shipmentId: truck.shipment?.id ?? null,
+        dockDoorId: chosen.dockId,
+        status: 'ASSIGNED',
+        score: chosen.score,
+        reasons: chosen.reasons,
+        scheduledStart: slot.start,
+        scheduledEnd: slot.end,
+        assignedAt: now,
+        previousAssignmentId: previous.id,
+      },
+      select: assignmentSelect,
+    });
+
+    let reserved: { id: string; code: string } | null = null;
+
+    if (liveStatus === 'AVAILABLE') {
+      await tx.dockDoor.update({
+        where: { id: chosen.dockId },
+        data: { status: 'RESERVED', availableFrom: slot.end },
+      });
+      reserved = { id: chosen.dockId, code: chosen.dockCode };
+    }
+
+    await clearAvailabilityIfUnheld(tx, previous.dockDoorId);
+
+    return { chosen, assignment: created, reserved };
+  });
+
+  const sink = dockingSink();
+
+  if (committed.reserved) {
+    sink.emit(
+      dockStatusChangedEvent(
+        {
+          id: committed.reserved.id,
+          code: committed.reserved.code,
+          status: 'RESERVED',
+          unavailableReason: null,
+        },
+        'AVAILABLE',
+        now,
+      ),
+    );
+  }
+
+  if (committed.assignment) {
+    sink.emit(
+      dockReassignedEvent(
+        {
+          id: committed.assignment.id,
+          truckId: truck.id,
+          shipmentId: truck.shipment?.id ?? null,
+          dockDoorId: committed.assignment.dockDoorId,
+          dockCode: committed.assignment.dockDoor.code,
+          status: committed.assignment.status,
+          score: committed.assignment.score,
+          reasons: committed.assignment.reasons,
+        },
+        previousView,
+        reason,
+        now,
+      ),
+    );
+  }
+
+  return {
+    outcome: committed.assignment ? 'REASSIGNED' : 'NO_DOCK_AVAILABLE',
+    truck: {
+      id: truck.id,
+      reference: truck.reference,
+      status: truck.status,
+      eta: truck.eta,
+      progress: truck.progress,
+    },
+    shipmentId: truck.shipment?.id ?? null,
+    loadType: truck.shipment?.loadType ?? null,
+    previous: previousView,
+    assignment: committed.assignment,
+    candidates: scored.recommendations,
+    excluded: scored.excluded,
   };
 }

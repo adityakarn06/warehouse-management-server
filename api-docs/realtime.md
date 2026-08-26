@@ -154,12 +154,11 @@ socket.on('TRUCK_POSITION_UPDATED', (data) => { /* data is TruckPositionPayload 
 | `ALERT_CREATED` | `operations` + the truck/shipment it names | Phase 6 |
 | `DOCK_STATUS_CHANGED` | `operations` | Phase 7 |
 | `DOCK_ASSIGNED` | `operations`, `truck:{id}`, `shipment:{id}` | Phase 7 |
-| `DOCK_REASSIGNED` | `operations`, `truck:{id}`, `shipment:{id}` | contract only — Phase 8 |
+| `DOCK_REASSIGNED` | `operations`, `truck:{id}`, `shipment:{id}` | Phase 8 |
 
-The last three are fully defined and routed today; no code path emits them yet, so
-a frontend can wire the handlers now and see them light up in later phases.
-`ALERT_CREATED` went live in Phase 6, when the delay commands became the first
-thing to raise an alert.
+Every event above is live. `ALERT_CREATED` went live in Phase 6 with the delay
+commands; the three dock events followed in Phases 7-8, with `DOCK_REASSIGNED`
+raised only by the dock-failure cascade.
 
 Payloads carry ids and scalars only (§24) — never route geometry, never a full
 database record.
@@ -286,7 +285,7 @@ Raised by `PATCH /api/v1/docks/:dockId/status`, and by the assignment engine
 whenever committing a dock reserves it or frees the door a truck just left.
 
 Operations-room only; the affected truck learns about the consequences through the
-`ALERT_CREATED` that follows (and, from Phase 8, `DOCK_REASSIGNED`).
+`ALERT_CREATED` and `DOCK_REASSIGNED` that follow.
 
 `status` is the **resulting** status, which is not always what was asked for:
 putting a door back into service while a booking still holds it yields
@@ -324,14 +323,21 @@ recommendation carried, persisted on the assignment row.
 }
 ```
 
-### `DOCK_REASSIGNED` *(contract only — Phase 8)*
+### `DOCK_REASSIGNED`
 
-`DOCK_ASSIGNED` plus where the truck came from.
+`DOCK_ASSIGNED` plus where the truck came from and why it had to leave. Raised
+only by the dock-failure cascade behind `PATCH /api/v1/docks/:dockId/status` — a
+truck moved by hand emits `DOCK_ASSIGNED` instead, which is what keeps
+"operations moved this truck" distinguishable from "the yard forced it to move".
+
+Everything the board needs for one line — `TRK-101 · D2 → D4 · Reason: …` — is in
+this payload; no follow-up fetch is required. `reasons` is the scoring engine's
+explanation of the *new* door; `reason` is why the old one was abandoned.
 
 ```json
 {
   "assignmentId": "clx...",
-  "previousAssignmentId": "clw...",
+  "previousAssignmentId": "DA-3002",
   "previousDockDoorId": "D2",
   "previousDockCode": "D2",
   "truckId": "TRK-101",
@@ -340,9 +346,24 @@ recommendation carried, persisted on the assignment row.
   "dockCode": "D4",
   "status": "ASSIGNED",
   "score": 87,
-  "reasons": ["D2 unavailable", "D4 compatible and free before ETA"],
+  "reasons": ["Compatible with refrigerated load", "Available before ETA"],
+  "reason": "D2 taken out of service: Hydraulic fault",
   "serverTimestamp": "2026-08-26T15:15:22.401Z"
 }
+```
+
+When no compatible door is left there is no `DOCK_REASSIGNED` at all — a
+`CRITICAL` `NO_DOCK_AVAILABLE` arrives through `ALERT_CREATED` instead, and the
+truck is left unassigned. The backend never invents a dock (§10).
+
+The full sequence a subscriber sees when a busy door goes down:
+
+```text
+DOCK_STATUS_CHANGED   D2 RESERVED -> UNAVAILABLE
+ALERT_CREATED         DOCK_UNAVAILABLE (WARNING)
+DOCK_STATUS_CHANGED   D4 AVAILABLE -> RESERVED
+DOCK_REASSIGNED       TRK-101  D2 -> D4
+ALERT_CREATED         DOCK_REASSIGNMENT (INFO)
 ```
 
 ---

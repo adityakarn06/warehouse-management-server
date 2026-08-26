@@ -2,57 +2,32 @@ import type { Express } from 'express';
 import request from 'supertest';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { createApp } from '../src/app.js';
-import type { DockingEvent, DockingEventSink } from '../src/docking/docking-events.js';
 import { resetDockingSink, setDockingSink } from '../src/docking/docking-events.js';
 import { disconnectPrisma, prisma } from '../src/lib/prisma.js';
+import type { YardSnapshot } from './docking-fixtures.js';
+import { RecordingSink, restoreYard, snapshotYard } from './docking-fixtures.js';
 
 /**
  * The docking write endpoints, driven through `createApp()` with supertest.
  *
  * This suite **writes to the seeded development database**, which
  * `read-api.test.ts` asserts exact values against — so every test restores what
- * it touched: dock doors go back to their opening snapshot, and any
- * assignment/alert row the suite created is deleted. Re-run `pnpm db:seed` if a
- * run is interrupted.
+ * it touched through `restoreYard()`. Re-run `pnpm db:seed` if a run is
+ * interrupted.
+ *
+ * The dock-failure cascade has a suite of its own: `dock-failure.test.ts`.
  *
  * There is no Socket.IO server here, so emissions are captured through a
  * recording `DockingEventSink` rather than a real socket.
  */
 
-class RecordingSink implements DockingEventSink {
-  readonly events: DockingEvent[] = [];
-
-  emit(event: DockingEvent): void {
-    this.events.push(event);
-  }
-
-  ofType<T extends DockingEvent['type']>(type: T): Extract<DockingEvent, { type: T }>[] {
-    return this.events.filter((event): event is Extract<DockingEvent, { type: T }> => event.type === type);
-  }
-}
-
 let app: Express;
 let sink: RecordingSink;
-
-type DockSnapshot = {
-  id: string;
-  status: string;
-  availableFrom: Date | null;
-  unavailableReason: string | null;
-};
-
-let dockSnapshots: DockSnapshot[] = [];
-let seededAssignmentIds: string[] = [];
-let seededAlertIds: string[] = [];
+let yard: YardSnapshot;
 
 beforeAll(async () => {
   app = createApp();
-
-  dockSnapshots = await prisma.dockDoor.findMany({
-    select: { id: true, status: true, availableFrom: true, unavailableReason: true },
-  });
-  seededAssignmentIds = (await prisma.dockAssignment.findMany({ select: { id: true } })).map((r) => r.id);
-  seededAlertIds = (await prisma.alert.findMany({ select: { id: true } })).map((r) => r.id);
+  yard = await snapshotYard();
 });
 
 beforeEach(() => {
@@ -61,26 +36,7 @@ beforeEach(() => {
 });
 
 afterEach(async () => {
-  // Rows first: an assignment still pointing at a door would block the reset.
-  await prisma.dockAssignment.deleteMany({ where: { id: { notIn: seededAssignmentIds } } });
-  await prisma.alert.deleteMany({ where: { id: { notIn: seededAlertIds } } });
-
-  for (const snapshot of dockSnapshots) {
-    await prisma.dockDoor.update({
-      where: { id: snapshot.id },
-      data: {
-        status: snapshot.status as DockSnapshot['status'] & 'AVAILABLE',
-        availableFrom: snapshot.availableFrom,
-        unavailableReason: snapshot.unavailableReason,
-      },
-    });
-  }
-
-  // The suite may have cancelled a seeded assignment on its way to a new one.
-  await prisma.dockAssignment.updateMany({
-    where: { id: { in: seededAssignmentIds }, status: 'CANCELLED' },
-    data: { status: 'ASSIGNED', releasedAt: null },
-  });
+  await restoreYard(yard);
 });
 
 afterAll(async () => {
@@ -290,7 +246,7 @@ describe('PATCH /api/v1/docks/:dockId/status', () => {
     expect(sink.events).toHaveLength(0);
   });
 
-  it('raises a DOCK_UNAVAILABLE alert naming what is stranded, and reassigns nothing', async () => {
+  it('raises a DOCK_UNAVAILABLE alert naming what was stranded', async () => {
     const res = await request(app)
       .patch('/api/v1/docks/D2/status')
       .send({ status: 'UNAVAILABLE' })
@@ -300,21 +256,46 @@ describe('PATCH /api/v1/docks/:dockId/status', () => {
     expect(res.body.data.affectedAssignments[0]).toMatchObject({ id: 'DA-3002' });
     expect(res.body.data.alert).toMatchObject({ type: 'DOCK_UNAVAILABLE', severity: 'WARNING', dockDoorId: 'D2' });
 
-    expect(sink.ofType('ALERT_CREATED')).toHaveLength(1);
-
-    // Phase 7 stops here: the assignment is untouched and no replacement exists.
-    const stranded = await prisma.dockAssignment.findUniqueOrThrow({ where: { id: 'DA-3002' } });
-    expect(stranded.status).toBe('ASSIGNED');
-    expect(stranded.dockDoorId).toBe('D2');
-    expect(await prisma.dockAssignment.count({ where: { truckId: 'TRK-101' } })).toBe(1);
+    // The alert is the first line of the timeline, not the whole story — where
+    // TRK-101 actually went is `dock-failure.test.ts`'s subject.
+    expect(res.body.data.reassignments).toHaveLength(1);
   });
 
-  it('restores a door that still holds a booking to RESERVED, not AVAILABLE', async () => {
+  it('comes back AVAILABLE once its booking has moved on', async () => {
+    // The Phase 8 cascade takes DA-3002 with it, so by the time D2 is repaired
+    // it genuinely holds nothing.
     await request(app).patch('/api/v1/docks/D2/status').send({ status: 'UNAVAILABLE' }).expect(200);
     const res = await request(app).patch('/api/v1/docks/D2/status').send({ status: 'AVAILABLE' }).expect(200);
 
+    expect(res.body.data.dock.status).toBe('AVAILABLE');
+    expect(res.body.data.dock.unavailableReason).toBeNull();
+  });
+
+  it('restores a door that still holds a booking to RESERVED, not AVAILABLE', async () => {
+    // No API path produces this any more — the cascade always moves or cancels
+    // the booking — but the WMS feed can, so build the state directly.
+    const scheduledEnd = new Date(Date.now() + 60 * 60_000);
+    await prisma.dockDoor.update({
+      where: { id: 'D3' },
+      data: { status: 'UNAVAILABLE', unavailableReason: 'Fire damage' },
+    });
+    await prisma.dockAssignment.create({
+      data: {
+        id: 'DA-TEST-SURVIVOR',
+        truckId: 'TRK-102',
+        dockDoorId: 'D3',
+        status: 'ASSIGNED',
+        scheduledStart: new Date(),
+        scheduledEnd,
+        assignedAt: new Date(),
+      },
+    });
+
+    const res = await request(app).patch('/api/v1/docks/D3/status').send({ status: 'AVAILABLE' }).expect(200);
+
     expect(res.body.data.dock.status).toBe('RESERVED');
     expect(res.body.data.dock.unavailableReason).toBeNull();
+    expect(new Date(res.body.data.dock.availableFrom).getTime()).toBe(scheduledEnd.getTime());
   });
 
   it('updates the reason when an already-down door is re-marked', async () => {

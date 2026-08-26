@@ -1,4 +1,4 @@
-import type { DockStatus } from '../generated/prisma/enums.js';
+import type { AssignmentStatus, DockStatus } from '../generated/prisma/enums.js';
 import { logger } from '../lib/logger.js';
 import type { AlertRecord } from '../services/alert-service.js';
 import type { AlertCreatedPayload, RealtimeEvent } from '../websocket/events.js';
@@ -16,10 +16,13 @@ import { tryGetRealtimeService } from '../websocket/index.js';
  * where `createApp()` runs without a websocket.
  */
 
-/** The three events the docking layer is allowed to raise in Phase 7. */
+/**
+ * The events the docking layer is allowed to raise. Phase 8 adds
+ * `DOCK_REASSIGNED`, the one event the failure path contributes.
+ */
 export type DockingEvent = Extract<
   RealtimeEvent,
-  { type: 'DOCK_ASSIGNED' | 'DOCK_STATUS_CHANGED' | 'ALERT_CREATED' }
+  { type: 'DOCK_ASSIGNED' | 'DOCK_REASSIGNED' | 'DOCK_STATUS_CHANGED' | 'ALERT_CREATED' }
 >;
 
 export interface DockingEventSink {
@@ -74,6 +77,54 @@ export function dockStatusChangedEvent(
       status: dock.status,
       // Optional on the wire: omit it rather than sending `undefined`.
       ...(dock.unavailableReason === null ? {} : { unavailableReason: dock.unavailableReason }),
+      serverTimestamp: at.toISOString(),
+    },
+  };
+}
+
+/** The row a reassignment produced, as the event builder needs it. */
+export interface ReassignedAssignmentSnapshot {
+  id: string;
+  truckId: string;
+  shipmentId: string | null;
+  dockDoorId: string;
+  dockCode: string;
+  status: AssignmentStatus;
+  score: number | null;
+  reasons: string[];
+}
+
+export interface SupersededAssignmentSnapshot {
+  id: string;
+  dockDoorId: string;
+  dockCode: string;
+}
+
+/**
+ * `DOCK_ASSIGNED` plus where the truck came from and why it left. Built here so
+ * the failure service never hand-rolls a payload the contract owns.
+ */
+export function dockReassignedEvent(
+  assignment: ReassignedAssignmentSnapshot,
+  previous: SupersededAssignmentSnapshot,
+  reason: string,
+  at: Date,
+): DockingEvent {
+  return {
+    type: 'DOCK_REASSIGNED',
+    data: {
+      assignmentId: assignment.id,
+      truckId: assignment.truckId,
+      shipmentId: assignment.shipmentId,
+      dockDoorId: assignment.dockDoorId,
+      dockCode: assignment.dockCode,
+      status: assignment.status,
+      score: assignment.score,
+      reasons: assignment.reasons,
+      previousAssignmentId: previous.id,
+      previousDockDoorId: previous.dockDoorId,
+      previousDockCode: previous.dockCode,
+      reason,
       serverTimestamp: at.toISOString(),
     },
   };

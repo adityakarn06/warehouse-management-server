@@ -195,6 +195,37 @@ describe('realtime room routing', () => {
     expect(emitter.emissions[0]?.rooms).toEqual([OPERATIONS_ROOM]);
   });
 
+  it('carries a reassignment to the truck and its customer, not just the yard', () => {
+    const emitter = new RecordingEmitter();
+    new RealtimeService(emitter).emit({
+      type: 'DOCK_REASSIGNED',
+      data: {
+        assignmentId: 'DA-NEW',
+        truckId: 'TRK-A',
+        shipmentId: 'SHP-A',
+        dockDoorId: 'D4',
+        dockCode: 'D4',
+        status: 'ASSIGNED',
+        score: 87,
+        reasons: ['Compatible with refrigerated load'],
+        previousAssignmentId: 'DA-OLD',
+        previousDockDoorId: 'D2',
+        previousDockCode: 'D2',
+        reason: 'D2 taken out of service: Hydraulic fault',
+        serverTimestamp: '2026-08-26T18:16:00.000Z',
+      },
+    });
+
+    // The dock going down is yard-only news; being *moved* is the truck's and
+    // the customer's business too.
+    expect(emitter.emissions[0]?.rooms).toEqual([
+      OPERATIONS_ROOM,
+      truckRoom('TRK-A'),
+      shipmentRoom('SHP-A'),
+    ]);
+    expect(emitter.emissions[0]?.event).toBe('DOCK_REASSIGNED');
+  });
+
   it('routes an alert to whichever entities it names', () => {
     const emitter = new RecordingEmitter();
     const service = new RealtimeService(emitter);

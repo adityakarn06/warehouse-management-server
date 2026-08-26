@@ -30,7 +30,7 @@ export type {
   TruckStatusPayload,
 };
 
-/** Emitted from Phase 8 onwards (`PATCH /docks/:id/status`). */
+/** Emitted from Phase 7 onwards (`PATCH /docks/:id/status`). */
 export interface DockStatusChangedPayload {
   dockDoorId: string;
   code: string;
@@ -58,6 +58,12 @@ export interface DockReassignedPayload extends DockAssignedPayload {
   previousAssignmentId: string;
   previousDockDoorId: string;
   previousDockCode: string;
+  /**
+   * Why the truck moved, e.g. "D2 taken out of service: hydraulic fault". The
+   * board renders `TRK-101 | D2 -> D4 | Reason: ...` straight off this event,
+   * so it must not need a second fetch to explain itself.
+   */
+  reason: string;
 }
 
 /**

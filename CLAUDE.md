@@ -45,8 +45,13 @@ Tests are Vitest in `tests/`, split by what they touch:
   Socket.IO — hand-built docks straight into `scoreDocks`.
 - `docking-api.test.ts` — the Phase 7 write endpoints via supertest. This one
   **writes to the seeded database** and restores what it touched in `afterEach`
-  (dock doors from an opening snapshot, plus deleting any assignment/alert row it
-  created). Emissions are captured with a recording `DockingEventSink`.
+  through `restoreYard()`. Emissions are captured with a recording
+  `DockingEventSink`.
+- `dock-failure.test.ts` — the Phase 8 cascade, also through supertest against the
+  seeded database: Scenario D (D2 → D4), Scenario E (no reefer door left),
+  double-booking refusal, and recovery/release. Shares the snapshot/restore
+  helpers in `tests/docking-fixtures.ts` (not a `.test.ts` file, so Vitest does
+  not collect it).
 - `realtime.test.ts` — the Socket.IO layer, also database-free: room routing
   against a recording `RealtimeEmitter`, the simulation→sink seam driving the real
   engine with a fake store, and an end-to-end test with two real `socket.io-client`
@@ -68,7 +73,7 @@ config via `import { env } from './config/index.js'`, never `process.env`
 
 ## Current state
 
-**Phases 1–7 are done.**
+**Phases 1–8 are done.**
 
 Phase 1 (foundation): config, logger, Prisma client, error handling,
 `/health` + `/api/v1/health` + `/api/v1/health/db`, bare Socket.IO server.
@@ -152,9 +157,9 @@ Clients subscribe explicitly (`subscribe:operations`, `subscribe:truck`,
 `subscribe:shipment`) and get their opening state in the Socket.IO **ack**;
 nothing is broadcast to a socket that did not ask. Events go out **by name**
 (`socket.on('TRUCK_POSITION_UPDATED', ...)`), not in a `{ type, data }` envelope.
-`DOCK_STATUS_CHANGED`, `DOCK_ASSIGNED` and `DOCK_REASSIGNED` are defined and
-routed but nothing emits them until Phases 7–8. `ALERT_CREATED` went live in
-Phase 6.
+`DOCK_STATUS_CHANGED` and `DOCK_ASSIGNED` went live in Phase 7, `DOCK_REASSIGNED`
+in Phase 8, and `ALERT_CREATED` in Phase 6 — every event in the contract now has
+a writer.
 
 Full reference with example payloads: `api-docs/api.md`, and
 `api-docs/realtime.md` for the Socket.IO contract.
@@ -187,6 +192,7 @@ src/schemas/docking.ts                 Zod for the two command bodies
 
 ```text
 PATCH /api/v1/docks/:dockId/status               { "status": "AVAILABLE" | "UNAVAILABLE", "reason"? }
+POST  /api/v1/docks/:dockId/release              (Phase 8)
 GET   /api/v1/trucks/:truckId/dock-recommendations
 POST  /api/v1/trucks/:truckId/dock-assignment    { "dockId"? }
 ```
@@ -195,15 +201,30 @@ POST  /api/v1/trucks/:truckId/dock-assignment    { "dockId"? }
 booked across the slot, frees up only after the slot ends) and then five weighted
 components summing to 100 — `loadTypeFit` 25, `availabilityFit` 30,
 `appointmentFit` 25, `priorityFit` 15, `statusBonus` 5 — each contributing a
-human sentence to `reasons`. `DOCK_ASSIGNED` and `DOCK_STATUS_CHANGED` went live;
-`DOCK_REASSIGNED` is still contract-only. New env var:
+human sentence to `reasons`. `DOCK_ASSIGNED` and `DOCK_STATUS_CHANGED` went live. New env var:
 `DOCK_DEFAULT_DURATION_MINUTES` (45). Tests: `tests/docking.test.ts` (pure) and
 `tests/docking-api.test.ts` (supertest, self-restoring).
 
+Phase 8 (dock failure + automatic reassignment): taking a door down now moves the
+trucks standing on it.
+
+```text
+src/docking/dock-failure-service.ts  handleDockFailure — the cascade + its alerts
+tests/docking-fixtures.ts            shared RecordingSink + yard snapshot/restore
+```
+
+`PATCH /docks/:dockId/status` with `UNAVAILABLE` still emits `DOCK_STATUS_CHANGED`
+and one `DOCK_UNAVAILABLE` alert, and then runs the cascade: each affected truck
+is re-scored against every remaining door by `reassignDock()` in
+`src/docking/dock-assignment-service.ts` and either moved (`REASSIGNED` old row →
+new `ASSIGNED` row chained by `previousAssignmentId`, one `DOCK_REASSIGNMENT`
+alert, `DOCK_REASSIGNED`) or reported as `NO_DOCK_AVAILABLE`. `POST
+/api/v1/docks/:dockId/release` finally routes the `releaseDock()` that Phase 7
+left unexposed. New response field: `reassignments` on the PATCH body. No new env
+vars.
+
 Still empty placeholder directories: `src/alerts` and `src/wms`.
-Sections 10–11, 15, 24–25 and 27–31 below describe the target system, not the code
-on disk. Automatic reassignment after a dock failure is Phase 8: taking down a
-door that holds an assignment raises a `DOCK_UNAVAILABLE` alert and stops there.
+Sections 15, 24 and 27–31 below describe the target system, not the code on disk.
 
 ## Conventions that are easy to get wrong
 
@@ -331,8 +352,10 @@ door that holds an assignment raises a `DOCK_UNAVAILABLE` alert and stops there.
   two files called `dock-assignment-service.ts` on purpose:
   `src/services/dock-assignment-service.ts` only lists rows for
   `GET /api/v1/dock-assignments`, while `src/docking/dock-assignment-service.ts`
-  owns every consequence of a recommendation being taken. `reassignDock()` is
-  deliberately absent from it rather than stubbed — that is Phase 8.
+  owns every consequence of a recommendation being taken — including
+  `reassignDock()`. The orchestration above it (`dock-failure-service.ts`) owns
+  the alerts and the per-truck loop and never writes an assignment row itself:
+  `DockFailureService → DockAssignmentService → AlertService → RealtimeService`.
 - **`dock-scoring.ts` is pure and env-free.** No Prisma, no clock, no
   `process.env`: it takes plain data and returns a ranking, which is what lets
   `tests/docking.test.ts` run without a database. The weights are algorithm
@@ -368,6 +391,57 @@ door that holds an assignment raises a `DOCK_UNAVAILABLE` alert and stops there.
   every dock door in `beforeAll` and, in `afterEach`, deletes any non-seeded
   assignment/alert row and puts the doors back. `pnpm db:seed` is still the reset
   of last resort if a run is interrupted.
+- **The failed door is excluded by the ordinary hard filter, not a special case.**
+  `handleDockFailure` runs *after* `setDockStatus` has already written
+  `UNAVAILABLE`, so `scoreDocks` drops the dock a truck is fleeing without
+  `reassignDock` knowing anything about it. Order matters: run the cascade before
+  the status write and the engine would cheerfully recommend the broken door back.
+- **`REASSIGNED` is the failure path's; `CANCELLED` is everyone else's.**
+  `reassignDock()` is the only writer of the `REASSIGNED` + `previousAssignmentId`
+  chain (seeded as DA-3005 → DA-3006), so the timeline distinguishes "operations
+  moved this truck" from "the yard forced it to move". `REASSIGNED` keeps
+  `releasedAt` null and stamps `reassignedAt` — it is a supersession, not a
+  release. `previousAssignmentId` is `@unique`, so a second failure chains
+  forward from the newest row rather than re-pointing the old one.
+- **No dock available means the truck is left unassigned, not parked on a corpse.**
+  The stranded row is `CANCELLED` and a `CRITICAL` `NO_DOCK_AVAILABLE` alert
+  carries the scorer's own exclusion sentences in `metadata.excluded`. One
+  consequence: no door ever carries a booking through an outage via the API any
+  more, so `setDockStatus`'s "came back `RESERVED`" branch is now only reachable
+  from state the WMS feed writes — it stays because it is still honest.
+- **One transaction per truck, not one per outage.** A door can hold several
+  bookings; they are resolved earliest-slot-first so the demo is deterministic,
+  and one truck's move failing must not roll back another's. The per-truck
+  transaction still covers superseding, creating and reserving together (§18).
+- **Scoring excludes a clashing door; `dockStillTakes` re-asks inside the
+  transaction.** Scoring reads before the write, so two simultaneous commits
+  would both see a free door, and a door can go out of service in between. The
+  recheck re-reads the door's *live* row and both write paths reserve against
+  the status it returns — flipping a since-broken door to `RESERVED` would clear
+  the fault from the board while leaving `unavailableReason` behind. It also
+  counts a committed booking with **no** scheduled window as a clash, because
+  Prisma comparisons never match NULL and the naive overlap test would wave one
+  through. `assignDock` turns a refusal into a 409; `reassignDock` walks to the
+  next recommendation. Postgres runs READ COMMITTED, so this narrows the race
+  rather than closing it — the complete fix is an exclusion constraint, which is
+  more migration than this demo needs.
+- **A truck the cascade could not move is reported, never dropped.** If
+  `reassignDock` throws, the truck is still `ASSIGNED` to a dead door, so
+  `handleDockFailure` raises a `CRITICAL` alert and pushes a
+  `REASSIGNMENT_FAILED` outcome rather than logging and moving on. An absent
+  entry in `reassignments` would be indistinguishable from a truck that was
+  never affected — which is the exact silent stranding the cascade exists to
+  prevent.
+- **The `DOCK_UNAVAILABLE` alert promises nothing about what happens next.** It
+  is written before the cascade runs, so wording it as "is being reassigned"
+  would be a lie on the no-dock path. It names what *was* assigned; the alert
+  that follows says where each truck ended up. Its trucks are ordered
+  earliest-slot-first, matching the order the cascade resolves them in.
+- **The docking suites snapshot whole rows now, not just ids.** Phase 8 rewrites
+  seeded assignments to `REASSIGNED`/`CANCELLED` and `DA-3005` is *seeded* as
+  `REASSIGNED`, so the old "reset everything to `ASSIGNED`" cleanup would corrupt
+  the very row the demo reads. `tests/docking-fixtures.ts` snapshots and restores
+  each row field by field, and both DB-writing suites share it.
 - **ETA holds steady under constant speed — that is correct.** `calculateEta`
   returns an absolute wall-clock instant, so what counts down is the time
   remaining, not the timestamp. An arrival time that drifts while the truck keeps

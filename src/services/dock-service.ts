@@ -1,3 +1,5 @@
+import { handleDockFailure } from '../docking/dock-failure-service.js';
+import type { ReassignmentOutcome } from '../docking/dock-failure-service.js';
 import {
   alertCreatedPayload,
   dockingSink,
@@ -143,7 +145,7 @@ export async function getDockById(idOrCode: string) {
   throw HttpError.notFound(`Dock door ${idOrCode} was not found`);
 }
 
-// --- Availability command (Phase 7) ------------------------------------
+// --- Availability command (Phase 7, cascade in Phase 8) ----------------
 
 /** Only these two are operator-settable; RESERVED/OCCUPIED are engine-owned. */
 export type DockAvailabilityStatus = Extract<DockStatus, 'AVAILABLE' | 'UNAVAILABLE'>;
@@ -185,16 +187,24 @@ export interface DockStatusResult {
   /** False when the door was already in that state — pressing twice is a no-op success. */
   changed: boolean;
   /**
-   * Committed assignments the door is still holding. Phase 7 leaves them where
-   * they are and only reports them; automatic reassignment is Phase 8 (§10).
+   * The committed assignments the door was holding when the command arrived.
+   * Reported as they were *before* the cascade ran; where each of those trucks
+   * ended up is `reassignments`.
    */
   affectedAssignments: Awaited<ReturnType<typeof findDockRow>>['assignments'];
+  /** The `DOCK_UNAVAILABLE` alert, when the door went down holding something. */
   alert: AlertCreatedPayload | null;
+  /** One entry per affected truck: where it moved, or why it could not (§10). */
+  reassignments: ReassignmentOutcome[];
 }
 
 /**
  * `PATCH /api/v1/docks/:dockId/status`. The frontend sends a status and nothing
  * else; the backend owns every consequence (§2, §8).
+ *
+ * Taking down a door that holds committed assignments raises one
+ * `DOCK_UNAVAILABLE` alert and then hands the affected trucks to
+ * `handleDockFailure`, which moves each of them or says `NO_DOCK_AVAILABLE`.
  */
 export async function setDockStatus(
   idOrCode: string,
@@ -221,10 +231,21 @@ export async function setDockStatus(
       changed: false,
       affectedAssignments: dock.assignments,
       alert: null,
+      reassignments: [],
     };
   }
 
-  const held = dock.assignments[0] ?? null;
+  // Earliest-slot-first, matching the order `handleDockFailure` resolves them
+  // in, so the alert names the same truck the cascade deals with first. The
+  // default `assignmentRecencyOrder` is newest-first, which on a multi-booking
+  // door would point at a different truck than the timeline that follows.
+  const affected = [...dock.assignments].sort((a, b) => {
+    const left = a.scheduledStart?.getTime() ?? Number.MAX_SAFE_INTEGER;
+    const right = b.scheduledStart?.getTime() ?? Number.MAX_SAFE_INTEGER;
+    return left - right || a.id.localeCompare(b.id);
+  });
+
+  const held = affected[0] ?? null;
 
   // The door is free again once its *last* booking ends, not its most recently
   // created one — and `scheduledEnd` is nullable, so fall back to whatever the
@@ -264,16 +285,20 @@ export async function setDockStatus(
         type: 'DOCK_UNAVAILABLE',
         severity: 'WARNING',
         title: `${dock.code} taken out of service`,
-        message: `${dock.code} is unavailable (${nextReason}). ${dock.assignments
+        // Deliberately says nothing about what happens next: this alert is
+        // written before the cascade runs, and promising a reassignment here
+        // would be a lie on the no-dock path. The alert that follows says where
+        // each truck actually ended up.
+        message: `${dock.code} is unavailable (${nextReason}). ${affected
           .map((row) => row.truck.reference)
-          .join(', ')} still assigned to it.`,
+          .join(', ')} was assigned to it.`,
         dockDoorId: dock.id,
         truckId: held?.truck.id ?? null,
         shipmentId: held?.shipmentId ?? null,
         metadata: {
           reason: nextReason,
-          affectedAssignments: dock.assignments.map((row) => row.id),
-          affectedTrucks: dock.assignments.map((row) => row.truck.reference),
+          affectedAssignments: affected.map((row) => row.id),
+          affectedTrucks: affected.map((row) => row.truck.reference),
         },
       });
 
@@ -284,10 +309,24 @@ export async function setDockStatus(
     }
   }
 
+  // Phase 8: the backend, not the frontend, decides where those trucks go (§2).
+  // This runs *after* the door is already UNAVAILABLE in the database, which is
+  // what makes the ordinary hard filter exclude it from its own trucks' options.
+  const reassignments =
+    status === 'UNAVAILABLE' && dock.assignments.length > 0
+      ? await handleDockFailure(
+          { id: dock.id, code: dock.code, reason: nextReason },
+          affected,
+          now,
+        )
+      : [];
+
   return {
+    // Re-read last: the cascade may have freed this door's `availableFrom`.
     dock: await getDockById(dock.id),
     changed: true,
     affectedAssignments: dock.assignments,
     alert,
+    reassignments,
   };
 }
