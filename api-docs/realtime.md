@@ -1,4 +1,4 @@
-# E2 Backend — Socket.IO Realtime API (Phase 5)
+# E2 Backend — Socket.IO Realtime API (Phases 5–7)
 
 Everything the frontend needs to consume live truck movement, alerts and dock
 changes. The REST surface is documented separately in [`api.md`](./api.md).
@@ -152,8 +152,8 @@ socket.on('TRUCK_POSITION_UPDATED', (data) => { /* data is TruckPositionPayload 
 | `TRUCK_ETA_UPDATED` | `operations`, `truck:{id}`, `shipment:{id}` | Phase 5 |
 | `TRUCK_STATUS_CHANGED` | `operations`, `truck:{id}`, `shipment:{id}` | Phase 5 |
 | `ALERT_CREATED` | `operations` + the truck/shipment it names | Phase 6 |
-| `DOCK_STATUS_CHANGED` | `operations` | contract only — Phase 8 |
-| `DOCK_ASSIGNED` | `operations`, `truck:{id}`, `shipment:{id}` | contract only — Phase 7 |
+| `DOCK_STATUS_CHANGED` | `operations` | Phase 7 |
+| `DOCK_ASSIGNED` | `operations`, `truck:{id}`, `shipment:{id}` | Phase 7 |
 | `DOCK_REASSIGNED` | `operations`, `truck:{id}`, `shipment:{id}` | contract only — Phase 8 |
 
 The last three are fully defined and routed today; no code path emits them yet, so
@@ -280,10 +280,18 @@ A delay activation emits `TRUCK_ETA_UPDATED`, then `TRUCK_STATUS_CHANGED`, then
 `GET /api/v1/alerts?type=TRUCK_DELAYED`, and its `metadata` carries the scenario,
 both speeds and the ETA shift in minutes.
 
-### `DOCK_STATUS_CHANGED` *(contract only — Phase 8)*
+### `DOCK_STATUS_CHANGED`
+
+Raised by `PATCH /api/v1/docks/:dockId/status`, and by the assignment engine
+whenever committing a dock reserves it or frees the door a truck just left.
 
 Operations-room only; the affected truck learns about the consequences through the
-`DOCK_REASSIGNED` and `ALERT_CREATED` that follow.
+`ALERT_CREATED` that follows (and, from Phase 8, `DOCK_REASSIGNED`).
+
+`status` is the **resulting** status, which is not always what was asked for:
+putting a door back into service while a booking still holds it yields
+`RESERVED`, not `AVAILABLE`. `unavailableReason` is absent unless the door is
+out of service.
 
 ```json
 {
@@ -296,7 +304,11 @@ Operations-room only; the affected truck learns about the consequences through t
 }
 ```
 
-### `DOCK_ASSIGNED` *(contract only — Phase 7)*
+### `DOCK_ASSIGNED`
+
+Raised by `POST /api/v1/trucks/:truckId/dock-assignment`. `reasons` is the
+explanation the scoring engine produced for that door — the same list the
+recommendation carried, persisted on the assignment row.
 
 ```json
 {

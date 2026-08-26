@@ -51,6 +51,14 @@ const envSchema = z.object({
   DELAY_MULTIPLIER_RAIN: z.coerce.number().positive().max(1).default(0.65),
   DELAY_MULTIPLIER_TRAFFIC: z.coerce.number().positive().max(1).default(0.45),
   DELAY_MULTIPLIER_ROAD_CLOSURE: z.coerce.number().positive().max(1).default(0.1),
+
+  // --- Docking (Phase 7) ------------------------------------------------
+  /**
+   * Dock time assumed for a truck with no appointment. Mirrors the schema
+   * default on `Appointment.expectedDurationMinutes`, so a truck that never
+   * booked a slot is scored against the same length of window as one that did.
+   */
+  DOCK_DEFAULT_DURATION_MINUTES: z.coerce.number().int().positive().default(45),
 });
 
 const parsed = envSchema.safeParse(process.env);

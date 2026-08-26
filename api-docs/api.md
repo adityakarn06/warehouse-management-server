@@ -1,4 +1,4 @@
-# E2 Backend — REST API (Phases 3–5: read APIs + simulation control)
+# E2 Backend — REST API (Phases 3–7: read APIs, simulation control, docking)
 
 Base URL: `http://localhost:4000`
 All domain endpoints live under `/api/v1`.
@@ -146,6 +146,7 @@ Returns the full route **including `geometry`** — an array of
 | --- | --- | --- |
 | `GET` | `/api/v1/docks` | `status`, `zone`, `loadType`, `limit`, `offset` |
 | `GET` | `/api/v1/docks/:id` | — |
+| `PATCH` | `/api/v1/docks/:id/status` | — (JSON body) |
 
 - `status`: `AVAILABLE` `RESERVED` `OCCUPIED` `UNAVAILABLE`
 - `loadType` matches against the dock's `supportedLoadTypes` list.
@@ -155,6 +156,153 @@ List rows include the dock's current assignment — `ASSIGNED` only, since a
 occupied. Assignment history on the detail route is capped at the 20 most recent.
 Detail rows include the full assignment history and the dock's unacknowledged
 alerts.
+
+#### `PATCH /api/v1/docks/:dockId/status` (Phase 7)
+
+The operator's two buttons — "make unavailable" and "make available". The
+frontend sends a status and nothing else; the backend owns every consequence
+(§2, §8).
+
+```jsonc
+// request
+{ "status": "UNAVAILABLE", "reason": "Hydraulic leveler fault" }
+```
+
+- `status`: `AVAILABLE` or `UNAVAILABLE` only. `RESERVED` and `OCCUPIED` are
+  owned by the assignment engine and the WMS feed; accepting them here would let
+  the board lie. Anything else is a `400`.
+- `reason` is optional and only recorded when going out of service. It defaults
+  to `"Marked unavailable by operations"`.
+
+```jsonc
+// response
+{
+  "data": {
+    "dock": { /* the full dock detail, as GET /docks/:id */ },
+    "changed": true,
+    "affectedAssignments": [
+      { "id": "DA-3002", "scheduledStart": "...", "scheduledEnd": "...",
+        "shipmentId": "SHP-1001",
+        "truck": { "id": "TRK-101", "reference": "TRK-101", "status": "IN_TRANSIT", "eta": "..." } }
+    ],
+    "alert": { "alertId": "clx...", "type": "DOCK_UNAVAILABLE", "severity": "WARNING", /* ... */ }
+  }
+}
+```
+
+Notes on behaviour:
+
+- Pressing the same button twice is a **no-op success**: `changed: false`, the
+  current state is returned and nothing is emitted.
+- Taking down a door that still holds an `ASSIGNED` row reports it in
+  `affectedAssignments` and raises one `DOCK_UNAVAILABLE` alert naming the
+  stranded trucks. **Phase 7 stops there** — the assignment is left in place and
+  no replacement is chosen. Automatic reassignment is Phase 8 (§10).
+- Putting a door back while a booking still holds it returns it to `RESERVED`,
+  not `AVAILABLE` — reporting a taken door as free would be a lie.
+- Emits `DOCK_STATUS_CHANGED`, plus `ALERT_CREATED` when an alert was raised. A
+  failed alert write is logged but never fails the command.
+- `404` on an unknown dock (id or `code`).
+
+### Dock recommendations and assignment (Phase 7)
+
+| Method | Path | Body |
+| --- | --- | --- |
+| `GET` | `/api/v1/trucks/:truckId/dock-recommendations` | — |
+| `POST` | `/api/v1/trucks/:truckId/dock-assignment` | `{ "dockId"?: string }` |
+
+#### `GET /api/v1/trucks/:truckId/dock-recommendations`
+
+Deterministic, explainable ranking of every door that can take the truck (§9).
+**Side-effect free** — a recommendation is a proposal, so nothing is written and
+operations can review it as often as they like.
+
+```jsonc
+{
+  "data": {
+    "truck": { "id": "TRK-101", "reference": "TRK-101", "status": "IN_TRANSIT", "eta": "...", "progress": 62 },
+    "shipment": { "id": "SHP-1001", "reference": "SHP-1001", "priority": "HIGH", "loadType": "REFRIGERATED" },
+    "appointment": { "reference": "APT-2001", "windowStart": "...", "windowEnd": "...", "expectedDurationMinutes": 60 },
+    // The slot the docks were scored against: the later of ETA and the booked
+    // window, plus the expected dock time.
+    "requestedWindow": { "start": "...", "end": "...", "minutes": 60 },
+    "currentAssignment": { "id": "DA-3002", "dockDoorId": "D2", "dockCode": "D2", "status": "ASSIGNED" },
+    "recommendations": [
+      {
+        "dockId": "D4",
+        "dockCode": "D4",
+        "dockName": "Dock Door 4 (reefer)",
+        "zone": "NORTH",
+        "status": "AVAILABLE",
+        "score": 96,
+        "reasons": [
+          "Compatible with refrigerated load",
+          "Available before ETA",
+          "Covers 50 of the 60 minutes booked",
+          "Suitable for high-priority shipment",
+          "Door is free right now"
+        ],
+        "breakdown": {
+          "loadTypeFit": 25, "availabilityFit": 30,
+          "appointmentFit": 20.8, "priorityFit": 15, "statusBonus": 5
+        },
+        "availableFrom": null
+      }
+    ],
+    "excluded": [
+      { "dockId": "D3", "dockCode": "D3", "reason": "Does not support REFRIGERATED loads" },
+      { "dockId": "D7", "dockCode": "D7", "reason": "Dock is out of service: Hydraulic leveler under maintenance" }
+    ]
+  }
+}
+```
+
+The score is out of 100 and its five components always sum to it, so a judge can
+read exactly why one door beat another:
+
+| Component | Max | What it measures |
+| --- | --- | --- |
+| `loadTypeFit` | 25 | Full marks for the load a specialist door exists for. General freight loses 5 per specialist type a door also supports (floor 10), so reefer doors stay free for reefers. |
+| `availabilityFit` | 30 | Free at or before the truck's slot start; decays linearly with how late the door frees up. |
+| `appointmentFit` | 25 | How much of the booked appointment the door can actually cover. A truck with no appointment scores a neutral 15. |
+| `priorityFit` | 15 | Lateness, weighted by priority — `HIGH`/`CRITICAL` punish a wait twice as hard as `MEDIUM`/`LOW`, so urgency changes the *ranking*, not just the total. |
+| `statusBonus` | 5 | `AVAILABLE` 5, `RESERVED` 3, `OCCUPIED` 0. |
+
+Four hard filters run before scoring; each produces an `excluded` entry with a
+sentence: the door is out of service, it cannot take the load type, it is already
+booked across the slot, or it only frees up after the slot has ended.
+
+#### `POST /api/v1/trucks/:truckId/dock-assignment`
+
+```jsonc
+// request — dockId optional
+{ "dockId": "D4" }
+```
+
+Returns the same body as the recommendation route plus `created`, `assignment`
+and `previousAssignment`. `201` when a new assignment row was written, `200` when
+the truck already held that door.
+
+Notes on behaviour:
+
+- Omitting `dockId` commits the **top-ranked** recommendation. Nothing is
+  auto-assigned on its own — a truck only gets a dock when someone asks (§9).
+- Naming a dock the engine excluded is a `400` quoting the exclusion reason
+  (`"Dock D3 cannot take TRK-101: Does not support REFRIGERATED loads"`). The
+  backend is the source of truth (§2), so this cannot be overridden.
+- `404` on an unknown truck or dock; `409` when no compatible dock exists and no
+  dock was named. We never invent a dock (§10) — Phase 8 turns this case into a
+  `NO_DOCK_AVAILABLE` alert.
+- Moving a truck cancels its previous row (`CANCELLED`, `releasedAt`) and frees
+  that door. `REASSIGNED` + `previousAssignmentId` is deliberately **not** used
+  here: that chain is reserved for Phase 8's dock-failure path.
+- Committing a dock flips it `AVAILABLE → RESERVED` with
+  `availableFrom = scheduledEnd`. `OCCUPIED` is the WMS's transition (Phase 9),
+  when a truck has physically backed in.
+- All of it — superseding the old row, freeing its door, creating the new row and
+  reserving its door — runs in one Prisma transaction (§18).
+- Emits `DOCK_ASSIGNED` (operations + `truck:{id}` + `shipment:{id}`) and a
+  `DOCK_STATUS_CHANGED` for each door whose status moved.
 
 ### Dock assignments
 
@@ -359,6 +507,10 @@ with Socket.IO: events are broadcast by name to the `operations`, `truck:{id}` a
 `shipment:{id}` rooms, and clients join by emitting `subscribe:operations` /
 `subscribe:truck` / `subscribe:shipment`, each answering with a state snapshot.
 
+Phase 7 adds `DOCK_ASSIGNED` and `DOCK_STATUS_CHANGED`, raised by the docking
+commands through their own sink for the same reason (§14) — no domain module
+imports Socket.IO.
+
 **The full realtime contract — every event, payload and room — is in
 [`realtime.md`](./realtime.md).**
 
@@ -406,4 +558,29 @@ curl -sX POST http://localhost:4000/api/v1/simulation/trucks/TRK-101/clear-delay
 
 # The alerts those delays raised
 curl -s 'http://localhost:4000/api/v1/alerts?type=TRUCK_DELAYED&limit=3' | jq
+
+# --- Docking (Phase 7) ---
+
+# Ranked, explainable dock options for an arriving refrigerated truck
+curl -s http://localhost:4000/api/v1/trucks/TRK-101/dock-recommendations | jq
+
+# Scenario D — assign the compatible replacement door by hand
+curl -s -X POST http://localhost:4000/api/v1/trucks/TRK-101/dock-assignment \
+  -H 'Content-Type: application/json' -d '{"dockId":"D4"}' | jq
+
+# ...or let the backend take its own top pick
+curl -s -X POST http://localhost:4000/api/v1/trucks/TRK-101/dock-assignment \
+  -H 'Content-Type: application/json' -d '{}' | jq
+
+# Take a dock out of service (raises DOCK_UNAVAILABLE if something is assigned)
+curl -s -X PATCH http://localhost:4000/api/v1/docks/D2/status \
+  -H 'Content-Type: application/json' \
+  -d '{"status":"UNAVAILABLE","reason":"Hydraulic leveler fault"}' | jq
+
+# ...and put it back
+curl -s -X PATCH http://localhost:4000/api/v1/docks/D2/status \
+  -H 'Content-Type: application/json' -d '{"status":"AVAILABLE"}' | jq
+
+# Scenario E — the only oversized door is occupied, so nothing is recommended
+curl -s http://localhost:4000/api/v1/trucks/TRK-109/dock-recommendations | jq '.data.excluded'
 ```

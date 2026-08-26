@@ -1,8 +1,16 @@
+import {
+  alertCreatedPayload,
+  dockingSink,
+  dockStatusChangedEvent,
+} from '../docking/docking-events.js';
 import type { DockStatus, LoadType } from '../generated/prisma/enums.js';
 import { HttpError } from '../lib/http-error.js';
+import { logger } from '../lib/logger.js';
 import { compact } from '../lib/object.js';
 import { prisma } from '../lib/prisma.js';
 import type { Pagination } from '../types/api.js';
+import type { AlertCreatedPayload } from '../websocket/events.js';
+import { createAlert } from './alert-service.js';
 import {
   assignmentRecencyOrder,
   committedAssignmentWhere,
@@ -133,4 +141,138 @@ export async function getDockById(idOrCode: string) {
   if (byCode) return byCode;
 
   throw HttpError.notFound(`Dock door ${idOrCode} was not found`);
+}
+
+// --- Availability command (Phase 7) ------------------------------------
+
+/** Only these two are operator-settable; RESERVED/OCCUPIED are engine-owned. */
+export type DockAvailabilityStatus = Extract<DockStatus, 'AVAILABLE' | 'UNAVAILABLE'>;
+
+const DEFAULT_UNAVAILABLE_REASON = 'Marked unavailable by operations';
+
+const dockCommandSelect = {
+  id: true,
+  code: true,
+  name: true,
+  status: true,
+  availableFrom: true,
+  unavailableReason: true,
+  assignments: {
+    where: committedAssignmentWhere,
+    orderBy: assignmentRecencyOrder,
+    select: {
+      id: true,
+      scheduledStart: true,
+      scheduledEnd: true,
+      shipmentId: true,
+      truck: { select: { id: true, reference: true, status: true, eta: true } },
+    },
+  },
+} as const;
+
+async function findDockRow(idOrCode: string) {
+  const byId = await prisma.dockDoor.findUnique({ where: { id: idOrCode }, select: dockCommandSelect });
+  if (byId) return byId;
+
+  const byCode = await prisma.dockDoor.findUnique({ where: { code: idOrCode }, select: dockCommandSelect });
+  if (byCode) return byCode;
+
+  throw HttpError.notFound(`Dock door ${idOrCode} was not found`);
+}
+
+export interface DockStatusResult {
+  dock: Awaited<ReturnType<typeof getDockById>>;
+  /** False when the door was already in that state — pressing twice is a no-op success. */
+  changed: boolean;
+  /**
+   * Committed assignments the door is still holding. Phase 7 leaves them where
+   * they are and only reports them; automatic reassignment is Phase 8 (§10).
+   */
+  affectedAssignments: Awaited<ReturnType<typeof findDockRow>>['assignments'];
+  alert: AlertCreatedPayload | null;
+}
+
+/**
+ * `PATCH /api/v1/docks/:dockId/status`. The frontend sends a status and nothing
+ * else; the backend owns every consequence (§2, §8).
+ */
+export async function setDockStatus(
+  idOrCode: string,
+  status: DockAvailabilityStatus,
+  reason?: string,
+  now = new Date(),
+): Promise<DockStatusResult> {
+  const dock = await findDockRow(idOrCode);
+  const previousStatus = dock.status;
+
+  // Taking a door out of service is only meaningful once, and putting one back
+  // only applies to a door that is actually out of service.
+  const noop =
+    status === 'UNAVAILABLE' ? previousStatus === 'UNAVAILABLE' : previousStatus !== 'UNAVAILABLE';
+
+  if (noop) {
+    return {
+      dock: await getDockById(dock.id),
+      changed: false,
+      affectedAssignments: dock.assignments,
+      alert: null,
+    };
+  }
+
+  const held = dock.assignments[0] ?? null;
+
+  const data =
+    status === 'UNAVAILABLE'
+      ? { status, unavailableReason: reason ?? DEFAULT_UNAVAILABLE_REASON }
+      : held
+        ? // A booking survived the outage, so the honest state is RESERVED —
+          // reporting AVAILABLE would show a taken door as free.
+          { status: 'RESERVED' as const, unavailableReason: null, availableFrom: held.scheduledEnd }
+        : { status, unavailableReason: null, availableFrom: null };
+
+  const updated = await prisma.dockDoor.update({
+    where: { id: dock.id },
+    data,
+    select: { id: true, code: true, status: true, unavailableReason: true },
+  });
+
+  const sink = dockingSink();
+  sink.emit(dockStatusChangedEvent(updated, previousStatus, now));
+
+  let alert: AlertCreatedPayload | null = null;
+
+  if (status === 'UNAVAILABLE' && dock.assignments.length > 0) {
+    // Losing the audit row must not fail the command — the door is
+    // authoritatively out of service either way (same rule as the delay path).
+    try {
+      const record = await createAlert({
+        type: 'DOCK_UNAVAILABLE',
+        severity: 'WARNING',
+        title: `${dock.code} taken out of service`,
+        message: `${dock.code} is unavailable (${reason ?? DEFAULT_UNAVAILABLE_REASON}). ${dock.assignments
+          .map((row) => row.truck.reference)
+          .join(', ')} still assigned to it.`,
+        dockDoorId: dock.id,
+        truckId: held?.truck.id ?? null,
+        shipmentId: held?.shipmentId ?? null,
+        metadata: {
+          reason: reason ?? DEFAULT_UNAVAILABLE_REASON,
+          affectedAssignments: dock.assignments.map((row) => row.id),
+          affectedTrucks: dock.assignments.map((row) => row.truck.reference),
+        },
+      });
+
+      alert = alertCreatedPayload(record);
+      sink.emit({ type: 'ALERT_CREATED', data: alert });
+    } catch (error) {
+      logger.error(`Failed to write DOCK_UNAVAILABLE alert for ${dock.code}`, error);
+    }
+  }
+
+  return {
+    dock: await getDockById(dock.id),
+    changed: true,
+    affectedAssignments: dock.assignments,
+    alert,
+  };
 }

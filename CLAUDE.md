@@ -41,6 +41,12 @@ Tests are Vitest in `tests/`, split by what they touch:
 - `simulation.test.ts` — pure engine tests. No database, no real timers: the
   `SimulationManager` takes its store, event sink and clock by injection, so the
   tests drive `manager.tick()` by hand against in-memory fakes.
+- `docking.test.ts` — the dock scoring engine. Pure: no database, no clock, no
+  Socket.IO — hand-built docks straight into `scoreDocks`.
+- `docking-api.test.ts` — the Phase 7 write endpoints via supertest. This one
+  **writes to the seeded database** and restores what it touched in `afterEach`
+  (dock doors from an opening snapshot, plus deleting any assignment/alert row it
+  created). Emissions are captured with a recording `DockingEventSink`.
 - `realtime.test.ts` — the Socket.IO layer, also database-free: room routing
   against a recording `RealtimeEmitter`, the simulation→sink seam driving the real
   engine with a fake store, and an end-to-end test with two real `socket.io-client`
@@ -62,7 +68,7 @@ config via `import { env } from './config/index.js'`, never `process.env`
 
 ## Current state
 
-**Phases 1–6 are done.**
+**Phases 1–7 are done.**
 
 Phase 1 (foundation): config, logger, Prisma client, error handling,
 `/health` + `/api/v1/health` + `/api/v1/health/db`, bare Socket.IO server.
@@ -103,6 +109,8 @@ onto `apiV1Router`:
 /api/v1/alerts                 ?type &severity &acknowledged &truckId &shipmentId &dockDoorId
 /api/v1/yard/overview
 ```
+
+Phase 7 adds the docking write surface listed further down.
 
 Phase 4 (simulation engine): the backend now owns truck movement.
 `src/simulation/simulation-manager.ts` runs **one** interval every
@@ -167,9 +175,35 @@ the authoritative resulting state. New env vars: `DELAY_MULTIPLIER_RAIN` (0.65),
 `createAlert` in `src/services/alert-service.ts` is the project's first alert
 writer, and Phase 8's dock alerts reuse it unchanged.
 
-Still empty placeholder directories: `src/docking`, `src/alerts` and `src/wms`.
-Sections 8–11, 15, 24–25 and 27–31 below describe the target system, not the code
-on disk.
+Phase 7 (dock availability + assignment engine): the warehouse side is now
+interactive.
+
+```text
+src/docking/dock-scoring.ts            the pure, deterministic scoring algorithm
+src/docking/dock-assignment-service.ts recommendDocks / assignDock / releaseDock
+src/docking/docking-events.ts          the DockingEventSink seam + payload builders
+src/schemas/docking.ts                 Zod for the two command bodies
+```
+
+```text
+PATCH /api/v1/docks/:dockId/status               { "status": "AVAILABLE" | "UNAVAILABLE", "reason"? }
+GET   /api/v1/trucks/:truckId/dock-recommendations
+POST  /api/v1/trucks/:truckId/dock-assignment    { "dockId"? }
+```
+
+`scoreDocks` runs four hard filters (out of service, incompatible load type,
+booked across the slot, frees up only after the slot ends) and then five weighted
+components summing to 100 — `loadTypeFit` 25, `availabilityFit` 30,
+`appointmentFit` 25, `priorityFit` 15, `statusBonus` 5 — each contributing a
+human sentence to `reasons`. `DOCK_ASSIGNED` and `DOCK_STATUS_CHANGED` went live;
+`DOCK_REASSIGNED` is still contract-only. New env var:
+`DOCK_DEFAULT_DURATION_MINUTES` (45). Tests: `tests/docking.test.ts` (pure) and
+`tests/docking-api.test.ts` (supertest, self-restoring).
+
+Still empty placeholder directories: `src/alerts` and `src/wms`.
+Sections 10–11, 15, 24–25 and 27–31 below describe the target system, not the code
+on disk. Automatic reassignment after a dock failure is Phase 8: taking down a
+door that holds an assignment raises a `DOCK_UNAVAILABLE` alert and stops there.
 
 ## Conventions that are easy to get wrong
 
@@ -288,6 +322,47 @@ on disk.
 - **The engine still never emits Socket.IO itself.** `createAlert` in
   `alert-service.ts` only writes; the manager emits `ALERT_CREATED` through its
   `SimulationEventSink` like every other event (§14).
+- **`src/docking` is the write side; `src/services` is the read side.** There are
+  two files called `dock-assignment-service.ts` on purpose:
+  `src/services/dock-assignment-service.ts` only lists rows for
+  `GET /api/v1/dock-assignments`, while `src/docking/dock-assignment-service.ts`
+  owns every consequence of a recommendation being taken. `reassignDock()` is
+  deliberately absent from it rather than stubbed — that is Phase 8.
+- **`dock-scoring.ts` is pure and env-free.** No Prisma, no clock, no
+  `process.env`: it takes plain data and returns a ranking, which is what lets
+  `tests/docking.test.ts` run without a database. The weights are algorithm
+  constants exported from the module, not env vars — unlike the delay
+  multipliers, they are not demo knobs. Reasons deliberately avoid absolute clock
+  times ("frees up 30 min after the truck is due", never "free at 18:40"): the
+  backend has no idea what timezone the operator reads, and relative phrasing
+  keeps the assertions honest.
+- **A door the truck already holds is not blocked for that truck.** Its own
+  reservation sets `DockDoor.availableFrom`, which would otherwise exclude the
+  dock from its own truck's recommendations, so `toScoringDock` nulls
+  `availableFrom` and drops the booked window when the holder is this truck.
+- **`RESERVED` is the assignment engine's; `OCCUPIED` is the WMS's.** Committing
+  a dock flips `AVAILABLE → RESERVED` with `availableFrom = scheduledEnd`. Only
+  Phase 9's WMS feed may say a truck has physically backed in. `PATCH
+  /docks/:id/status` therefore accepts only `AVAILABLE` and `UNAVAILABLE` —
+  letting an operator hand-set the other two would let the board lie.
+- **Manual re-pick is `CANCELLED`; `REASSIGNED` belongs to Phase 8.** Moving a
+  truck by hand cancels the old row and frees its door. The
+  `REASSIGNED` + `previousAssignmentId` chain (seeded as DA-3005 → DA-3006) is
+  reserved for the dock-failure path, so the timeline stays readable.
+- **Putting a door back in service can yield `RESERVED`, not `AVAILABLE`.** If a
+  booking survived the outage, that is the honest state — the response and the
+  `DOCK_STATUS_CHANGED` payload both carry the *resulting* status, not the
+  requested one.
+- **The docking sink defaults to the realtime one, so `server.ts` is untouched.**
+  `realtimeDockingSink` resolves through `tryGetRealtimeService()`, which returns
+  `null` instead of throwing — which is exactly why the docking endpoints work
+  under the supertest suites, where `createApp()` runs with no websocket. Tests
+  swap it with `setDockingSink()` and restore with `resetDockingSink()`.
+- **`tests/docking-api.test.ts` writes to the seeded database and restores it.**
+  `read-api.test.ts` asserts exact seeded values, so the docking suite snapshots
+  every dock door in `beforeAll` and, in `afterEach`, deletes any non-seeded
+  assignment/alert row and puts the doors back. `pnpm db:seed` is still the reset
+  of last resort if a run is interrupted.
 - **ETA holds steady under constant speed — that is correct.** `calculateEta`
   returns an absolute wall-clock instant, so what counts down is the time
   remaining, not the timestamp. An arrival time that drifts while the truck keeps
