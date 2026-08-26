@@ -1,3 +1,12 @@
+// E2: Where's My Truck? — domain model (Phase 2)
+//
+// Design notes:
+// - PostgreSQL holds persistent business state only. Per-tick simulation
+//   internals (interpolation cursors, tick counters, sequence numbers) stay in
+//   memory in the simulation engine; the Truck row holds the last authoritative
+//   snapshot so state survives a restart.
+// - Deterministic string ids (TRK-101, D3, SHP-1001, ...) are seeded so the
+//   frontend can hit /api/v1/trucks/TRK-101 directly during the hackathon.
 
 generator client {
   provider = "prisma-client"
@@ -7,4 +16,373 @@ generator client {
 
 datasource db {
   provider = "postgresql"
+}
+
+// ---------------------------------------------------------------------------
+// Enums
+// ---------------------------------------------------------------------------
+
+enum Priority {
+  LOW
+  MEDIUM
+  HIGH
+  CRITICAL
+}
+
+enum LoadType {
+  GENERAL
+  REFRIGERATED
+  HAZARDOUS
+  OVERSIZED
+}
+
+enum TruckStatus {
+  IN_TRANSIT
+  DELAYED
+  ARRIVING
+  ARRIVED
+  DOCKED
+  COMPLETED
+}
+
+enum ShipmentStatus {
+  CREATED
+  IN_TRANSIT
+  DELAYED
+  ARRIVING
+  ARRIVED
+  DOCKED
+  DELIVERED
+}
+
+enum DockStatus {
+  AVAILABLE
+  RESERVED
+  OCCUPIED
+  UNAVAILABLE
+}
+
+enum AssignmentStatus {
+  RECOMMENDED
+  ASSIGNED
+  REASSIGNED
+  COMPLETED
+  CANCELLED
+}
+
+enum AlertType {
+  TRUCK_DELAYED
+  DOCK_UNAVAILABLE
+  DOCK_REASSIGNMENT
+  NO_DOCK_AVAILABLE
+  TRUCK_ARRIVING
+}
+
+enum AlertSeverity {
+  INFO
+  WARNING
+  CRITICAL
+}
+
+// Active delay scenario for a truck. NORMAL means "no delay".
+// Persisted (not ephemeral) so a restart restores the demo state.
+enum DelayScenario {
+  NORMAL
+  RAIN
+  TRAFFIC
+  ROAD_CLOSURE
+}
+
+// Why a LocationHistory row was written. Snapshots are meaningful events only,
+// never one row per simulation tick.
+enum LocationSnapshotReason {
+  DEPARTURE
+  PERIODIC
+  DELAY_ACTIVATED
+  DELAY_CLEARED
+  ARRIVING
+  ARRIVED
+  DOCKED
+  COMPLETED
+}
+
+// ---------------------------------------------------------------------------
+// Route
+// ---------------------------------------------------------------------------
+
+/// Predefined route geometry used by the simulation. Geometry is fixed; the
+/// truck's progress along it is what changes.
+model Route {
+  id   String @id @default(cuid())
+  code String @unique // RTE-DEL-KOL-01
+
+  name String
+
+  originName      String
+  originLatitude  Float
+  originLongitude Float
+
+  destinationName      String
+  destinationLatitude  Float
+  destinationLongitude Float
+
+  distanceKm               Float
+  estimatedDurationMinutes Int
+  averageSpeedKmph         Float @default(60)
+
+  /// Ordered coordinate list: [{ latitude, longitude }, ...]. Kept as JSON
+  /// because it is read whole by the simulation and never queried by field.
+  geometry Json
+
+  trucks Truck[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+// ---------------------------------------------------------------------------
+// Truck
+// ---------------------------------------------------------------------------
+
+/// Truck + trailer. Holds the authoritative backend position/ETA snapshot.
+model Truck {
+  id        String @id @default(cuid())
+  reference String @unique // TRK-101
+  trailerId String @unique // TRL-101
+
+  driverName  String
+  driverPhone String?
+  carrier     String
+
+  status      TruckStatus   @default(IN_TRANSIT)
+  activeDelay DelayScenario @default(NORMAL)
+
+  routeId String
+  route   Route  @relation(fields: [routeId], references: [id])
+
+  // Authoritative simulation state (last tick), persisted only on meaningful
+  // transitions and periodic checkpoints — not every 2 seconds.
+  currentLatitude  Float
+  currentLongitude Float
+  /// 0-100 along the route geometry.
+  progress         Float     @default(0)
+  speedKmph        Float     @default(60)
+  eta              DateTime?
+
+  departedAt    DateTime?
+  arrivedAt     DateTime?
+  lastUpdatedAt DateTime  @default(now())
+
+  shipment        Shipment?
+  dockAssignments DockAssignment[]
+  alerts          Alert[]
+  locationHistory LocationHistory[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([status])
+  @@index([routeId])
+}
+
+// ---------------------------------------------------------------------------
+// Shipment
+// ---------------------------------------------------------------------------
+
+/// Customer-facing shipment. One shipment rides on one truck/trailer.
+model Shipment {
+  id             String @id @default(cuid())
+  reference      String @unique // SHP-1001
+  trackingNumber String @unique // E2-TRACK-101
+
+  customerName    String
+  originName      String
+  destinationName String
+
+  status   ShipmentStatus @default(IN_TRANSIT)
+  priority Priority       @default(MEDIUM)
+  loadType LoadType       @default(GENERAL)
+
+  weightKg    Float?
+  palletCount Int?
+  description String?
+
+  /// One truck carries one shipment in this system.
+  truckId String @unique
+  truck   Truck  @relation(fields: [truckId], references: [id])
+
+  appointment     Appointment?
+  dockAssignments DockAssignment[]
+  alerts          Alert[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([status])
+  @@index([priority])
+}
+
+// ---------------------------------------------------------------------------
+// Appointment
+// ---------------------------------------------------------------------------
+
+/// Booked arrival window for a shipment at the warehouse.
+model Appointment {
+  id        String @id @default(cuid())
+  reference String @unique // APT-2001
+
+  shipmentId String   @unique
+  shipment   Shipment @relation(fields: [shipmentId], references: [id], onDelete: Cascade)
+
+  windowStart DateTime
+  windowEnd   DateTime
+
+  /// Minutes of dock time the appointment is expected to consume.
+  expectedDurationMinutes Int     @default(45)
+  notes                   String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([windowStart])
+}
+
+// ---------------------------------------------------------------------------
+// DockDoor
+// ---------------------------------------------------------------------------
+
+/// A physical dock door. Many historical assignments, at most one ASSIGNED /
+/// OCCUPIED assignment at a time (enforced by the dock assignment service).
+model DockDoor {
+  id   String @id @default(cuid())
+  code String @unique // D1
+  name String
+
+  zone   String     @default("MAIN")
+  status DockStatus @default(AVAILABLE)
+
+  /// Load types this door can physically handle.
+  supportedLoadTypes LoadType[]
+
+  /// Position on the yard map.
+  latitude  Float
+  longitude Float
+
+  /// Scheduled next free time; null means free now.
+  availableFrom     DateTime?
+  unavailableReason String?
+
+  assignments DockAssignment[]
+  alerts      Alert[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([status])
+}
+
+// ---------------------------------------------------------------------------
+// DockAssignment
+// ---------------------------------------------------------------------------
+
+/// A recommendation or a committed assignment of a truck to a dock door.
+/// Reassignment keeps the old row (status REASSIGNED) and links it to the new
+/// one, so the timeline is explainable to judges.
+model DockAssignment {
+  id String @id @default(cuid())
+
+  truckId String
+  truck   Truck  @relation(fields: [truckId], references: [id], onDelete: Cascade)
+
+  shipmentId String?
+  shipment   Shipment? @relation(fields: [shipmentId], references: [id])
+
+  dockDoorId String
+  dockDoor   DockDoor @relation(fields: [dockDoorId], references: [id])
+
+  status AssignmentStatus @default(RECOMMENDED)
+
+  /// Deterministic score from the dock scoring engine, plus the human-readable
+  /// reasons that produced it.
+  score   Float?
+  reasons String[] @default([])
+
+  scheduledStart DateTime?
+  scheduledEnd   DateTime?
+
+  assignedAt   DateTime?
+  releasedAt   DateTime?
+  reassignedAt DateTime?
+
+  /// Reassignment chain: previous -> replacement.
+  previousAssignmentId  String?         @unique
+  previousAssignment    DockAssignment? @relation("AssignmentChain", fields: [previousAssignmentId], references: [id])
+  replacementAssignment DockAssignment? @relation("AssignmentChain")
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([truckId, status])
+  @@index([dockDoorId, status])
+}
+
+// ---------------------------------------------------------------------------
+// Alert
+// ---------------------------------------------------------------------------
+
+/// Operational alert raised by backend domain logic and pushed over Socket.IO.
+model Alert {
+  id       String        @id @default(cuid())
+  type     AlertType
+  severity AlertSeverity @default(INFO)
+
+  title   String
+  message String
+
+  truckId String?
+  truck   Truck?  @relation(fields: [truckId], references: [id], onDelete: Cascade)
+
+  shipmentId String?
+  shipment   Shipment? @relation(fields: [shipmentId], references: [id])
+
+  dockDoorId String?
+  dockDoor   DockDoor? @relation(fields: [dockDoorId], references: [id])
+
+  /// Extra context (old dock, new dock, delay type, ...).
+  metadata Json?
+
+  acknowledged   Boolean   @default(false)
+  acknowledgedAt DateTime?
+
+  createdAt DateTime @default(now())
+
+  @@index([createdAt])
+  @@index([type])
+  @@index([truckId])
+}
+
+// ---------------------------------------------------------------------------
+// LocationHistory
+// ---------------------------------------------------------------------------
+
+/// Meaningful location snapshots only (departure, delay change, arrival,
+/// docking, occasional checkpoints). Never written per simulation tick.
+model LocationHistory {
+  id String @id @default(cuid())
+
+  truckId String
+  truck   Truck  @relation(fields: [truckId], references: [id], onDelete: Cascade)
+
+  latitude  Float
+  longitude Float
+  progress  Float
+  speedKmph Float
+  status    TruckStatus
+  eta       DateTime?
+
+  reason LocationSnapshotReason @default(PERIODIC)
+
+  recordedAt DateTime @default(now())
+
+  @@index([truckId, recordedAt])
 }

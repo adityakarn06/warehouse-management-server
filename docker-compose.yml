@@ -1,0 +1,21 @@
+services:
+  postgres:
+    image: postgres:17
+    container_name: e2-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: e2
+      POSTGRES_PASSWORD: e2password
+      POSTGRES_DB: e2
+    ports:
+      - '5432:5432'
+    volumes:
+      - e2-pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U e2 -d e2']
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  e2-pgdata:

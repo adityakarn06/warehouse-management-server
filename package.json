@@ -13,7 +13,13 @@
     "prisma:migrate": "prisma migrate dev",
     "prisma:deploy": "prisma migrate deploy",
     "prisma:seed": "prisma db seed",
-    "prisma:studio": "prisma studio"
+    "prisma:studio": "prisma studio",
+    "typecheck:seed": "tsc -p tsconfig.seed.json --noEmit",
+    "db:up": "docker compose up -d",
+    "db:down": "docker compose down",
+    "db:reset": "prisma migrate reset --force && prisma db seed",
+    "db:seed": "prisma db seed",
+    "db:studio": "prisma studio"
   },
   "keywords": [],
   "author": "",

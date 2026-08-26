@@ -12,11 +12,21 @@ pnpm dev                     # tsx watch src/server.ts — HTTP + Socket.IO on :
 pnpm build                   # prisma generate && tsc
 pnpm start                   # node dist/server.js
 pnpm typecheck               # tsc --noEmit — run this after every change
+pnpm typecheck:seed          # tsc -p tsconfig.seed.json — covers prisma/seed.ts
 pnpm prisma:migrate          # prisma migrate dev
 pnpm prisma:generate         # regenerates the client into src/generated/prisma
-pnpm prisma:seed             # runs prisma/seed.ts via tsx
-pnpm prisma:studio
+
+pnpm db:up                   # docker compose up -d  (postgres:17 as e2-postgres)
+pnpm db:down                 # docker compose down
+pnpm db:seed                 # runs prisma/seed.ts via tsx (idempotent — wipes, then reseeds)
+pnpm db:reset                # DROPS the db, remigrates, reseeds (Prisma 7's `migrate reset`
+                             # no longer runs the seed itself, so the script chains `db seed`)
+pnpm db:studio               # prisma studio
 ```
+
+`pnpm typecheck` covers `src/` only — the root tsconfig excludes `prisma/seed.ts`
+because its `rootDir` is `./src`. Run `pnpm typecheck:seed` after touching the
+seed.
 
 No test runner is configured yet. When the first tests land, wire one up
 (and add `test` / single-test invocation here) rather than leaving §23 aspirational.
@@ -29,12 +39,33 @@ config via `import { env } from './config/index.js'`, never `process.env`
 
 ## Current state
 
-Only **Phase 1 (foundation)** exists: config, logger, Prisma client, error
-handling, `/health` + `/api/v1/health` + `/api/v1/health/db`, and a bare
-Socket.IO server. `prisma/schema.prisma` defines **no domain models yet**, and
-`src/services`, `src/simulation`, `src/eta`, `src/docking`, `src/alerts`,
-`src/wms` are empty placeholder directories. Sections 2–31 below describe the
-target system, not the code on disk.
+**Phases 1–2 are done.**
+
+Phase 1 (foundation): config, logger, Prisma client, error handling,
+`/health` + `/api/v1/health` + `/api/v1/health/db`, bare Socket.IO server.
+
+Phase 2 (persistence): `prisma/schema.prisma` defines all eight domain models
+(Route, Truck, Shipment, Appointment, DockDoor, DockAssignment, Alert,
+LocationHistory) plus the enums in §17, migrated as
+`prisma/migrations/*_init_domain_model`. `prisma/seed.ts` writes a deterministic
+demo warehouse: 3 routes, 8 dock doors, 12 trucks, 12 shipments,
+12 appointments, 6 dock assignments, 7 alerts, 11 location snapshots.
+
+Seeded rows use their human reference as the primary key — `Truck.id` is
+`"TRK-101"`, `DockDoor.id` is `"D3"`, `Shipment.id` is `"SHP-1001"`,
+`Route.id` is `"RTE-DEL-KOL-01"` — so `/api/v1/trucks/TRK-101` works by id.
+Rows created at runtime still get a `cuid()`. The `reference` / `code` /
+`trackingNumber` unique columns remain for lookup-by-reference routes.
+
+All seed timestamps are fixed offsets from one `BASE` = the top of the current
+hour, so the demo is byte-identical in shape on every run but always sits around
+"now". The seed deliberately sets up the §25 demo scenarios: TRK-101 → D2 with
+D4 as the compatible replacement (Scenario D), and SHP-1009 oversized with the
+only oversized door D6 occupied (Scenario E).
+
+Still empty placeholder directories: `src/services`, `src/simulation`,
+`src/eta`, `src/docking`, `src/alerts`, `src/wms`. Sections 4–16 and 18–31 below
+describe the target system, not the code on disk.
 
 ## Conventions that are easy to get wrong
 
