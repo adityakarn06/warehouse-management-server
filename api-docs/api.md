@@ -285,8 +285,9 @@ the truck already held that door.
 
 Notes on behaviour:
 
-- Omitting `dockId` commits the **top-ranked** recommendation. Nothing is
-  auto-assigned on its own — a truck only gets a dock when someone asks (§9).
+- Omitting `dockId` — or sending no body at all — commits the **top-ranked**
+  recommendation. Nothing is auto-assigned on its own: a truck only gets a dock
+  when someone asks (§9).
 - Naming a dock the engine excluded is a `400` quoting the exclusion reason
   (`"Dock D3 cannot take TRK-101: Does not support REFRIGERATED loads"`). The
   backend is the source of truth (§2), so this cannot be overridden.

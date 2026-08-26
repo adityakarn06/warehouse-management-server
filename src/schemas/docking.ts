@@ -22,8 +22,11 @@ export type DockStatusCommand = z.infer<typeof dockStatusCommandSchema>;
  * `POST /trucks/:truckId/dock-assignment`. `dockId` is optional: omitting it
  * commits the top-ranked recommendation, which is the demo's one-click flow.
  */
-export const assignDockCommandSchema = z.object({
-  dockId: z.string().min(1).optional(),
-});
+export const assignDockCommandSchema = z
+  .object({ dockId: z.string().min(1).optional() })
+  // Express 5 leaves `req.body` undefined when a request carries no body at
+  // all, so `curl -X POST .../dock-assignment` would otherwise 400 instead of
+  // taking the top recommendation. The default makes "no body" mean "{}".
+  .default({});
 
 export type AssignDockCommand = z.infer<typeof assignDockCommandSchema>;

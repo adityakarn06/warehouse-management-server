@@ -152,6 +152,23 @@ describe('scoreDocks — scoring', () => {
     expect(first!.score).toBeGreaterThan(second!.score);
   });
 
+  it('does not treat an occupied door with no scheduled free time as free', () => {
+    // Phase 9's WMS may set OCCUPIED without an availableFrom; reading that
+    // silence as "free now" would recommend a door with a truck on it.
+    const result = scoreDocks(
+      [
+        dock({ id: 'D1', code: 'D1' }),
+        dock({ id: 'D2', code: 'D2', status: 'OCCUPIED', availableFrom: null }),
+      ],
+      context(),
+    );
+
+    const occupied = result.recommendations.find((row) => row.dockCode === 'D2');
+    expect(occupied?.breakdown.availabilityFit).toBe(0);
+    expect(occupied?.reasons).toContain('Occupied with no scheduled free time');
+    expect(result.recommendations[0]?.dockCode).toBe('D1');
+  });
+
   it('lets the appointment window change the score', () => {
     const roomy = scoreDocks([dock()], context()).recommendations[0]!;
     // The truck arrives 40 minutes into its own hour-long booking, so only 20

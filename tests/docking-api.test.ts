@@ -170,6 +170,26 @@ describe('POST /api/v1/trucks/:truckId/dock-assignment', () => {
     expect(res.body.data.assignment.dockDoor.code).toBe(best);
   });
 
+  it('takes the top recommendation when the request carries no body at all', async () => {
+    // Express 5 leaves `req.body` undefined for a bodyless POST, which used to
+    // 400 instead of running the one-click flow.
+    const res = await request(app).post('/api/v1/trucks/TRK-112/dock-assignment').expect(201);
+
+    expect(res.body.data.created).toBe(true);
+    expect(res.body.data.assignment.dockDoor.code).toBe('D5');
+  });
+
+  it('reports the dock the truck now holds, not the one it left', async () => {
+    const res = await request(app)
+      .post('/api/v1/trucks/TRK-101/dock-assignment')
+      .send({ dockId: 'D4' })
+      .expect(201);
+
+    expect(res.body.data.currentAssignment).toMatchObject({ dockCode: 'D4', status: 'ASSIGNED' });
+    expect(res.body.data.currentAssignment.id).toBe(res.body.data.assignment.id);
+    expect(res.body.data.previousAssignment).toMatchObject({ dockCode: 'D2' });
+  });
+
   it('rejects a dock that cannot take the load with a 400 naming why', async () => {
     // TRK-112 carries a HAZARDOUS shipment; D3 is a general-freight door.
     const res = await request(app)
@@ -295,6 +315,29 @@ describe('PATCH /api/v1/docks/:dockId/status', () => {
 
     expect(res.body.data.dock.status).toBe('RESERVED');
     expect(res.body.data.dock.unavailableReason).toBeNull();
+  });
+
+  it('updates the reason when an already-down door is re-marked', async () => {
+    await request(app)
+      .patch('/api/v1/docks/D3/status')
+      .send({ status: 'UNAVAILABLE', reason: 'Hydraulic leveler fault' })
+      .expect(200);
+
+    const res = await request(app)
+      .patch('/api/v1/docks/D3/status')
+      .send({ status: 'UNAVAILABLE', reason: 'Fire damage' })
+      .expect(200);
+
+    expect(res.body.data.changed).toBe(true);
+    expect(res.body.data.dock.unavailableReason).toBe('Fire damage');
+
+    // Restating the *same* reason really is a no-op.
+    const again = await request(app)
+      .patch('/api/v1/docks/D3/status')
+      .send({ status: 'UNAVAILABLE', reason: 'Fire damage' })
+      .expect(200);
+
+    expect(again.body.data.changed).toBe(false);
   });
 
   it('rejects a status the operator does not own', async () => {

@@ -65,6 +65,9 @@ const dockCandidateSelect = {
   unavailableReason: true,
   assignments: {
     where: committedAssignmentWhere,
+    // `createdAt` alone is not unique (the seed stamps a batch), so without the
+    // id tiebreak any `[0]` read here would be non-deterministic.
+    orderBy: assignmentRecencyOrder,
     select: { id: true, truckId: true, scheduledStart: true, scheduledEnd: true },
   },
 } as const;
@@ -143,7 +146,10 @@ function toScoringDock(dock: DockCandidate, truckId: string): ScoringDock {
   // A door this truck already holds is not blocked *for this truck*: both its
   // `availableFrom` and its booked window are that truck's own reservation, and
   // scoring them as a clash would make re-picking the same dock impossible.
+  // Only discount it when this truck is the *sole* holder, though — another
+  // truck's reservation still has to count against the door.
   const heldBySelf = dock.assignments.some((row) => row.truckId === truckId);
+  const heldByOthers = dock.assignments.some((row) => row.truckId !== truckId);
 
   return {
     id: dock.id,
@@ -152,7 +158,7 @@ function toScoringDock(dock: DockCandidate, truckId: string): ScoringDock {
     zone: dock.zone,
     status: dock.status,
     supportedLoadTypes: [...dock.supportedLoadTypes],
-    availableFrom: heldBySelf ? null : dock.availableFrom,
+    availableFrom: heldBySelf && !heldByOthers ? null : dock.availableFrom,
     unavailableReason: dock.unavailableReason,
     bookedWindows: dock.assignments
       .filter((row) => row.truckId !== truckId && row.scheduledStart && row.scheduledEnd)
@@ -366,14 +372,18 @@ export async function assignDock(
   const { assignment, freedDockStatus } = await prisma.$transaction(async (tx) => {
     let freed: FreedDock | null = null;
 
-    if (current && previousDock) {
+    if (current) {
+      // Unconditional: leaving the old row ASSIGNED would give the truck two
+      // live assignments even if its old door could not be resolved below.
       await tx.dockAssignment.update({
         where: { id: current.id },
         // Manual re-pick, not a dock failure: REASSIGNED + previousAssignmentId
         // stays reserved for Phase 8's failure chain.
         data: { status: 'CANCELLED', releasedAt: now },
       });
+    }
 
+    if (current && previousDock) {
       // Only release the door if nothing else still holds it.
       const stillHeld = await tx.dockAssignment.count({
         where: { dockDoorId: previousDock.id, ...committedAssignmentWhere, id: { not: current.id } },
@@ -460,6 +470,15 @@ export async function assignDock(
 
   return {
     ...recommendationView(loaded),
+    // `recommendationView` is built from the pre-write context, so its
+    // `currentAssignment` still names the door the truck just left. The
+    // authoritative answer is the row we just wrote.
+    currentAssignment: {
+      id: assignment.id,
+      dockDoorId: assignment.dockDoorId,
+      dockCode: assignment.dockDoor.code,
+      status: assignment.status,
+    },
     created: true,
     assignment,
     previousAssignment: current
@@ -472,7 +491,7 @@ export interface ReleaseResult {
   dockDoorId: string;
   dockCode: string;
   status: DockStatus;
-  releasedAssignmentId: string | null;
+  releasedAssignmentIds: string[];
 }
 
 /**
@@ -482,12 +501,14 @@ export interface ReleaseResult {
  */
 export async function releaseDock(dockIdOrCode: string, now = new Date()): Promise<ReleaseResult> {
   const dock = await findDock(dockIdOrCode);
-  const held = dock.assignments[0] ?? null;
+  const held = dock.assignments;
 
   const updated = await prisma.$transaction(async (tx) => {
-    if (held) {
-      await tx.dockAssignment.update({
-        where: { id: held.id },
+    if (held.length > 0) {
+      // Every committed row, not just the newest: handing the door back while
+      // one of them is still ASSIGNED would report a committed door as free.
+      await tx.dockAssignment.updateMany({
+        where: { id: { in: held.map((row) => row.id) } },
         data: { status: 'COMPLETED', releasedAt: now },
       });
     }
@@ -513,6 +534,6 @@ export async function releaseDock(dockIdOrCode: string, now = new Date()): Promi
     dockDoorId: updated.id,
     dockCode: updated.code,
     status: updated.status,
-    releasedAssignmentId: held?.id ?? null,
+    releasedAssignmentIds: held.map((row) => row.id),
   };
 }

@@ -205,8 +205,15 @@ function scoreLoadType(dock: ScoringDock, ctx: ScoringContext): [number, string]
   return [fit, `Handles general freight, but is a ${labels} door worth keeping free`];
 }
 
-function scoreAvailability(lateness: number, lateMinutes: number): [number, string] {
+function scoreAvailability(
+  lateness: number,
+  lateMinutes: number,
+  freeTimeUnknown: boolean,
+): [number, string] {
   const fit = WEIGHT_AVAILABILITY_FIT * (1 - lateness);
+  if (freeTimeUnknown) {
+    return [fit, 'Occupied with no scheduled free time'];
+  }
   if (lateMinutes <= 0) {
     return [fit, 'Available before ETA'];
   }
@@ -277,12 +284,21 @@ export function scoreDocks(docks: ScoringDock[], ctx: ScoringContext): ScoringRe
       continue;
     }
 
+    // A truck is physically on an OCCUPIED door. With no `availableFrom` there
+    // is nothing to say when it leaves, and reading that silence as "free now"
+    // would recommend a door that is in use — assume it stays busy instead.
+    const freeTimeUnknown = dock.status === 'OCCUPIED' && dock.availableFrom === null;
+
     const lateMs = Math.max(0, (dock.availableFrom?.getTime() ?? 0) - ctx.windowStart.getTime());
-    const lateness = clamp(lateMs / windowMs, 0, 1);
+    const lateness = freeTimeUnknown ? 1 : clamp(lateMs / windowMs, 0, 1);
     const lateMinutes = Math.round(lateMs / MS_PER_MINUTE);
 
     const [loadTypeFit, loadTypeReason] = scoreLoadType(dock, ctx);
-    const [availabilityFit, availabilityReason] = scoreAvailability(lateness, lateMinutes);
+    const [availabilityFit, availabilityReason] = scoreAvailability(
+      lateness,
+      lateMinutes,
+      freeTimeUnknown,
+    );
     const [appointmentFit, appointmentReason] = scoreAppointment(dock, ctx);
     const [priorityFit, priorityReason] = scorePriority(ctx, lateness, lateMinutes);
     const statusBonus = STATUS_BONUS[dock.status];

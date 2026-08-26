@@ -322,6 +322,11 @@ door that holds an assignment raises a `DOCK_UNAVAILABLE` alert and stops there.
 - **The engine still never emits Socket.IO itself.** `createAlert` in
   `alert-service.ts` only writes; the manager emits `ALERT_CREATED` through its
   `SimulationEventSink` like every other event (§14).
+- **Express 5 leaves `req.body` undefined when a request carries no body.** Not
+  `{}` — undefined, which makes `z.object({...}).parse()` throw a 400. A command
+  body whose fields are all optional must therefore end in `.default({})`, as
+  `assignDockCommandSchema` does, or `curl -X POST <url>` fails instead of taking
+  the default path.
 - **`src/docking` is the write side; `src/services` is the read side.** There are
   two files called `dock-assignment-service.ts` on purpose:
   `src/services/dock-assignment-service.ts` only lists rows for

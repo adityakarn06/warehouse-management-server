@@ -206,9 +206,14 @@ export async function setDockStatus(
   const previousStatus = dock.status;
 
   // Taking a door out of service is only meaningful once, and putting one back
-  // only applies to a door that is actually out of service.
+  // only applies to a door that is actually out of service. Re-stating the
+  // reason for a door that is already down is not a no-op, though: the new
+  // reason is what every `excluded` sentence will quote from here on.
+  const nextReason = reason ?? DEFAULT_UNAVAILABLE_REASON;
   const noop =
-    status === 'UNAVAILABLE' ? previousStatus === 'UNAVAILABLE' : previousStatus !== 'UNAVAILABLE';
+    status === 'UNAVAILABLE'
+      ? previousStatus === 'UNAVAILABLE' && dock.unavailableReason === nextReason
+      : previousStatus !== 'UNAVAILABLE';
 
   if (noop) {
     return {
@@ -221,13 +226,23 @@ export async function setDockStatus(
 
   const held = dock.assignments[0] ?? null;
 
+  // The door is free again once its *last* booking ends, not its most recently
+  // created one — and `scheduledEnd` is nullable, so fall back to whatever the
+  // door already claimed rather than asserting it is free now.
+  const scheduledEnds = dock.assignments
+    .map((row) => row.scheduledEnd)
+    .filter((end): end is Date => end !== null);
+  const heldUntil = scheduledEnds.length
+    ? new Date(Math.max(...scheduledEnds.map((end) => end.getTime())))
+    : dock.availableFrom;
+
   const data =
     status === 'UNAVAILABLE'
-      ? { status, unavailableReason: reason ?? DEFAULT_UNAVAILABLE_REASON }
+      ? { status, unavailableReason: nextReason }
       : held
         ? // A booking survived the outage, so the honest state is RESERVED —
           // reporting AVAILABLE would show a taken door as free.
-          { status: 'RESERVED' as const, unavailableReason: null, availableFrom: held.scheduledEnd }
+          { status: 'RESERVED' as const, unavailableReason: null, availableFrom: heldUntil }
         : { status, unavailableReason: null, availableFrom: null };
 
   const updated = await prisma.dockDoor.update({
@@ -249,14 +264,14 @@ export async function setDockStatus(
         type: 'DOCK_UNAVAILABLE',
         severity: 'WARNING',
         title: `${dock.code} taken out of service`,
-        message: `${dock.code} is unavailable (${reason ?? DEFAULT_UNAVAILABLE_REASON}). ${dock.assignments
+        message: `${dock.code} is unavailable (${nextReason}). ${dock.assignments
           .map((row) => row.truck.reference)
           .join(', ')} still assigned to it.`,
         dockDoorId: dock.id,
         truckId: held?.truck.id ?? null,
         shipmentId: held?.shipmentId ?? null,
         metadata: {
-          reason: reason ?? DEFAULT_UNAVAILABLE_REASON,
+          reason: nextReason,
           affectedAssignments: dock.assignments.map((row) => row.id),
           affectedTrucks: dock.assignments.map((row) => row.truck.reference),
         },

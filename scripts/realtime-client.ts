@@ -147,7 +147,9 @@ async function main(): Promise<void> {
   await new Promise((resolve) => setTimeout(resolve, SECONDS * 1000));
 
   summarise(ops);
-  summarise(tracker, TRUCK);
+  // Payloads carry the canonical id, which only equals `TRUCK` because seeded
+  // rows use their reference as the primary key. Prefer the id from the ack.
+  summarise(tracker, trackedTruckId ?? TRUCK);
 
   const strayTrucks = [...new Set(tracker.positions.map((p) => p.truckId))].filter(
     (id) => id !== TRUCK && id !== trackedTruckId,
