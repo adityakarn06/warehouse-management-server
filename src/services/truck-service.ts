@@ -2,6 +2,7 @@ import type { DelayScenario, TruckStatus } from '../generated/prisma/enums.js';
 import { HttpError } from '../lib/http-error.js';
 import { compact } from '../lib/object.js';
 import { prisma } from '../lib/prisma.js';
+import { MOVING_STATUSES } from '../simulation/live-state.js';
 import type { Pagination } from '../types/api.js';
 import {
   appointmentSelect,
@@ -134,4 +135,54 @@ export async function getTruckById(idOrReference: string) {
   if (byReference) return byReference;
 
   throw HttpError.notFound(`Truck ${idOrReference} was not found`);
+}
+
+/**
+ * The lean row behind a realtime snapshot: everything `LiveTruckView` needs and
+ * nothing else — no route geometry, no assignment history, no location log.
+ *
+ * The simulation's in-memory state answers first; this is the fallback for a
+ * truck the loop is not advancing (`DOCKED`, `COMPLETED`, or the loop stopped),
+ * so a tracking client still gets a position on join. Returns `null` instead of
+ * throwing, because the caller answers through a socket ack.
+ */
+const truckLiveSelect = {
+  id: true,
+  reference: true,
+  routeId: true,
+  status: true,
+  activeDelay: true,
+  currentLatitude: true,
+  currentLongitude: true,
+  progress: true,
+  speedKmph: true,
+  eta: true,
+  arrivedAt: true,
+  lastUpdatedAt: true,
+  shipment: { select: { id: true } },
+} as const;
+
+export async function getTruckLiveRow(idOrReference: string) {
+  return (
+    (await prisma.truck.findUnique({ where: { id: idOrReference }, select: truckLiveSelect })) ??
+    (await prisma.truck.findUnique({
+      where: { reference: idOrReference },
+      select: truckLiveSelect,
+    }))
+  );
+}
+
+/**
+ * Every truck the simulation would be advancing, as live rows. This is the
+ * fallback behind the `operations` snapshot: with the loop stopped (autostart
+ * off, or before the first `start()`) the in-memory map is empty, and a
+ * dashboard must still join to a populated yard rather than an empty one.
+ */
+export async function listMovingTruckLiveRows() {
+  return prisma.truck.findMany({
+    // Not inside the `as const` above: Prisma rejects readonly filter arrays.
+    where: { status: { in: MOVING_STATUSES } },
+    select: truckLiveSelect,
+    orderBy: { reference: 'asc' },
+  });
 }

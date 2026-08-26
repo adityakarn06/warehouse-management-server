@@ -39,10 +39,18 @@ interface TrackedTruck {
 }
 
 export class SimulationManager {
-  private readonly deps: SimulationManagerDeps;
+  private deps: SimulationManagerDeps;
   private readonly live = new LiveStateStore();
   private readonly profiles = new Map<string, RouteProfile>();
   private readonly lastTickAt = new Map<string, number>();
+  /**
+   * Highest sequence number ever emitted per truck. Deliberately survives
+   * `reset()` and the `live.clear()` inside it: clients drop any update whose
+   * sequence is below the last one they applied, so a counter that restarted at
+   * 0 under a still-connected dashboard would make it discard every update
+   * until the count climbed back.
+   */
+  private readonly lastSequence = new Map<string, number>();
 
   private timer: NodeJS.Timeout | null = null;
   /** In-flight tick(), so stop() can wait for it instead of racing it. */
@@ -59,6 +67,16 @@ export class SimulationManager {
 
   constructor(deps: SimulationManagerDeps) {
     this.deps = deps;
+  }
+
+  /**
+   * Swaps the realtime sink. The singleton below is constructed at import time,
+   * before the Socket.IO server exists, so `server.ts` attaches the
+   * Socket.IO-backed sink here once `initWebsocket()` has returned. The engine
+   * still never imports Socket.IO (§14) — it only ever sees a `SimulationEventSink`.
+   */
+  setSink(sink: SimulationEventSink): void {
+    this.deps = { ...this.deps, sink };
   }
 
   isRunning(): boolean {
@@ -160,12 +178,23 @@ export class SimulationManager {
   async reset(): Promise<void> {
     return this.enqueue(async () => {
       logger.info('Resetting simulation');
+      // Reset restores state; it does not decide whether the loop runs. An
+      // operator who stopped the simulation and then reset it must not find the
+      // trucks moving again.
+      const wasRunning = this.timer !== null;
+
       await this.runStop();
       this.live.clear();
       this.profiles.clear();
       this.lastTickAt.clear();
       clearRouteProfileCache();
-      await this.runStart();
+
+      if (wasRunning) {
+        await this.runStart();
+      } else {
+        // Still reload, so `GET /simulation/state` reflects the database.
+        await this.load();
+      }
     });
   }
 
@@ -225,7 +254,11 @@ export class SimulationManager {
 
     for (const row of rows) {
       try {
-        loaded.push({ state: toLiveState(row, loadedAt), profile: buildRouteProfile(row.route) });
+        loaded.push({
+          // Resume this truck's counter rather than restarting it at 0.
+          state: toLiveState(row, loadedAt, this.lastSequence.get(row.id) ?? 0),
+          profile: buildRouteProfile(row.route),
+        });
       } catch (error) {
         skipped.push(row.reference);
         logger.error(`Cannot simulate ${row.reference} on route ${row.route.id}`, error);
@@ -275,6 +308,7 @@ export class SimulationManager {
 
     const next = result.state;
     this.live.set(next);
+    this.lastSequence.set(next.truckId, next.sequenceNumber);
 
     this.emitPosition(next, profile);
     if (result.etaChanged) this.emitEta(next);
@@ -397,7 +431,11 @@ export class SimulationManager {
   }
 }
 
-export function toLiveState(row: SimulationTruckRow, loadedAt: Date): LiveTruckState {
+export function toLiveState(
+  row: SimulationTruckRow,
+  loadedAt: Date,
+  sequenceNumber = 0,
+): LiveTruckState {
   return {
     truckId: row.id,
     reference: row.reference,
@@ -412,7 +450,7 @@ export function toLiveState(row: SimulationTruckRow, loadedAt: Date): LiveTruckS
     activeDelay: row.activeDelay,
     arrivedAt: row.arrivedAt,
     lastUpdatedAt: loadedAt,
-    sequenceNumber: 0,
+    sequenceNumber,
     lastPersistedProgress: row.progress,
     dirty: false,
   };

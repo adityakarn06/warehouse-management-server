@@ -4,12 +4,17 @@ import { env } from './config/index.js';
 import { logger } from './lib/logger.js';
 import { disconnectPrisma } from './lib/prisma.js';
 import { simulationManager } from './simulation/simulation-manager.js';
-import { closeWebsocket, initWebsocket } from './websocket/index.js';
+import { closeWebsocket, initWebsocket, realtimeSimulationSink } from './websocket/index.js';
 
 const app = createApp();
 const httpServer = createServer(app);
 
 initWebsocket(httpServer);
+
+// §14: the engine emits domain events into a sink and never imports Socket.IO.
+// The sink resolves the live service per event rather than capturing one, so a
+// close/re-init cannot leave the engine emitting into a torn-down server.
+simulationManager.setSink(realtimeSimulationSink());
 
 httpServer.listen(env.PORT, env.HOST, () => {
   logger.info(`HTTP + Socket.IO listening on http://${env.HOST}:${env.PORT} (${env.NODE_ENV})`);

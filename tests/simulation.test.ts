@@ -584,14 +584,33 @@ describe('simulation lifecycle', () => {
     await h.advance(ONE_HOUR / 6);
     expect(h.manager.getTruckState('TRK-TEST')?.progress).toBeCloseTo(10, 4);
 
+    const sequenceBefore = h.manager.getTruckState('TRK-TEST')!.sequenceNumber;
+    expect(sequenceBefore).toBeGreaterThan(0);
+
     await h.manager.reset();
 
     expect(h.store.loadCount).toBe(2);
     expect(h.manager.isRunning()).toBe(true);
     // Back to whatever the store reports — the fake still hands out progress 0.
     expect(h.manager.getTruckState('TRK-TEST')?.progress).toBe(0);
-    expect(h.manager.getTruckState('TRK-TEST')?.sequenceNumber).toBe(0);
+    // The sequence counter is per-run bookkeeping a connected client uses to
+    // drop stale updates, so a reset must not rewind it under that client.
+    expect(h.manager.getTruckState('TRK-TEST')?.sequenceNumber).toBe(sequenceBefore);
 
     await h.manager.stop();
+  });
+
+  it('a reset of a stopped simulation reloads without starting the loop', async () => {
+    const h = harness();
+    await h.manager.start();
+    await h.advance(ONE_HOUR / 6);
+    await h.manager.stop();
+
+    await h.manager.reset();
+
+    expect(h.manager.isRunning()).toBe(false);
+    expect(h.store.loadCount).toBe(2);
+    // Reloaded from the store even though the loop stays stopped.
+    expect(h.manager.getTruckState('TRK-TEST')?.progress).toBe(0);
   });
 });

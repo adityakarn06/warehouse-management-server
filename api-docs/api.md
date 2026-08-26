@@ -1,4 +1,4 @@
-# E2 Backend — REST API (Phases 3–4: read APIs + simulation control)
+# E2 Backend — REST API (Phases 3–5: read APIs + simulation control)
 
 Base URL: `http://localhost:4000`
 All domain endpoints live under `/api/v1`.
@@ -224,7 +224,7 @@ Delay commands (`/delay`, `/clear-delay`) are Phase 6 and are not implemented ye
 | --- | --- | --- |
 | `POST` | `/api/v1/simulation/start` | Idempotent — a second call is ignored, never a second loop |
 | `POST` | `/api/v1/simulation/stop` | Stops the loop and flushes unpersisted movement |
-| `POST` | `/api/v1/simulation/reset` | Stop, reload from the database, start. A full demo rewind is `pnpm db:seed` |
+| `POST` | `/api/v1/simulation/reset` | Reload the world from the database, keeping the loop's running/stopped state. A full demo rewind is `pnpm db:seed` |
 | `GET` | `/api/v1/simulation/state` | Live state for every simulated truck |
 | `GET` | `/api/v1/simulation/trucks/:truckId` | One truck, by id or reference |
 
@@ -265,27 +265,13 @@ A truck that is not being simulated (terminal status, or the loop is not running
 ### Realtime events
 
 The engine emits `TRUCK_POSITION_UPDATED`, `TRUCK_ETA_UPDATED` and
-`TRUCK_STATUS_CHANGED` into a `SimulationEventSink`. Phase 5 backs that sink with
-Socket.IO rooms; until then the default sink logs. The position payload carries
-`previous*` and `target*` coordinates so the frontend can interpolate between the
-2-second authoritative updates:
+`TRUCK_STATUS_CHANGED` into a `SimulationEventSink` (§14). Phase 5 backs that sink
+with Socket.IO: events are broadcast by name to the `operations`, `truck:{id}` and
+`shipment:{id}` rooms, and clients join by emitting `subscribe:operations` /
+`subscribe:truck` / `subscribe:shipment`, each answering with a state snapshot.
 
-```json
-{
-  "type": "TRUCK_POSITION_UPDATED",
-  "data": {
-    "truckId": "TRK-101",
-    "latitude": 24.92185, "longitude": 85.31402,
-    "previousLatitude": 24.92198, "previousLongitude": 85.31418,
-    "targetLatitude": 24.92172, "targetLongitude": 85.31386,
-    "progress": 62.18175,
-    "eta": "2026-08-27T00:58:11.954Z",
-    "status": "IN_TRANSIT",
-    "serverTimestamp": "2026-08-26T15:15:22.401Z",
-    "sequenceNumber": 10
-  }
-}
-```
+**The full realtime contract — every event, payload and room — is in
+[`realtime.md`](./realtime.md).**
 
 ---
 

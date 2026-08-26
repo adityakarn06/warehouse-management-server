@@ -17,6 +17,7 @@ pnpm typecheck:test          # tsc -p tsconfig.test.json — covers tests/
 pnpm test                    # vitest run — integration tests against the seeded db
 pnpm test:watch              # vitest
 pnpm vitest run -t "yard"    # single test / suite by name
+pnpm realtime:demo           # two Socket.IO clients against a running server
 pnpm prisma:migrate          # prisma migrate dev
 pnpm prisma:generate         # regenerates the client into src/generated/prisma
 
@@ -40,6 +41,10 @@ Tests are Vitest in `tests/`, split by what they touch:
 - `simulation.test.ts` — pure engine tests. No database, no real timers: the
   `SimulationManager` takes its store, event sink and clock by injection, so the
   tests drive `manager.tick()` by hand against in-memory fakes.
+- `realtime.test.ts` — the Socket.IO layer, also database-free: room routing
+  against a recording `RealtimeEmitter`, the simulation→sink seam driving the real
+  engine with a fake store, and an end-to-end test with two real `socket.io-client`
+  connections against a server on an ephemeral port.
 
 **Re-seed before `pnpm test` if `pnpm dev` has been running.** Autostart moves the
 same rows `read-api.test.ts` asserts on, so a long dev session will eventually
@@ -57,7 +62,7 @@ config via `import { env } from './config/index.js'`, never `process.env`
 
 ## Current state
 
-**Phases 1–4 are done.**
+**Phases 1–5 are done.**
 
 Phase 1 (foundation): config, logger, Prisma client, error handling,
 `/health` + `/api/v1/health` + `/api/v1/health/db`, bare Socket.IO server.
@@ -122,13 +127,34 @@ is set. New env vars: `SIMULATION_TICK_MS`, `SIMULATION_AUTOSTART`,
 `SIMULATION_SPEED_MULTIPLIER`, `SIMULATION_ARRIVING_PROGRESS`,
 `SIMULATION_CHECKPOINT_PROGRESS_STEP`.
 
-Full reference with example payloads: `api-docs/api.md`.
+Phase 5 (Socket.IO realtime): the engine's events now reach the browser.
 
-Still empty placeholder directories: `src/docking`, `src/alerts`, `src/wms`, and
-`src/websocket` holds only the bare Socket.IO server. Delay scenarios (§7) are
-Phase 6 and are **not** implemented — the engine simply uses each truck's stored
-`speedKmph`, which is why the seeded DELAYED trucks already crawl. Sections 7–15,
-24–25 and 27–31 below describe the target system, not the code on disk.
+```text
+src/websocket/events.ts           the typed contract — all 7 events + payloads
+src/websocket/rooms.ts            operations / truck:{id} / shipment:{id}, and roomsFor()
+src/websocket/realtime-service.ts RealtimeService — the only Socket.IO caller
+src/websocket/socket-server.ts    connection logging + the subscribe protocol
+src/websocket/snapshots.ts        SnapshotProvider — the state a subscriber joins with
+src/websocket/index.ts            barrel: initWebsocket / getIO / getRealtimeService / closeWebsocket
+src/schemas/realtime.ts           Zod for the subscribe payloads
+scripts/realtime-client.ts        `pnpm realtime:demo` — two-client verification script
+```
+
+Clients subscribe explicitly (`subscribe:operations`, `subscribe:truck`,
+`subscribe:shipment`) and get their opening state in the Socket.IO **ack**;
+nothing is broadcast to a socket that did not ask. Events go out **by name**
+(`socket.on('TRUCK_POSITION_UPDATED', ...)`), not in a `{ type, data }` envelope.
+`ALERT_CREATED`, `DOCK_STATUS_CHANGED`, `DOCK_ASSIGNED` and `DOCK_REASSIGNED` are
+defined and routed but nothing emits them until Phases 7–8.
+
+Full reference with example payloads: `api-docs/api.md`, and
+`api-docs/realtime.md` for the Socket.IO contract.
+
+Still empty placeholder directories: `src/docking`, `src/alerts` and `src/wms`.
+Delay scenarios (§7) are Phase 6 and are **not** implemented — the engine simply
+uses each truck's stored `speedKmph`, which is why the seeded DELAYED trucks
+already crawl. Sections 7–11, 15, 24–25 and 27–31 below describe the target
+system, not the code on disk.
 
 ## Conventions that are easy to get wrong
 
@@ -196,7 +222,29 @@ Phase 6 and are **not** implemented — the engine simply uses each truck's stor
   coordinate index. Route geometry is read-only and its `RouteProfile` is
   memoised per route, so it is parsed and measured once, not per tick.
 - **The engine never imports Socket.IO.** It emits domain events into a
-  `SimulationEventSink` (§14). Phase 5 supplies the Socket.IO-backed sink.
+  `SimulationEventSink` (§14); `server.ts` attaches the Socket.IO-backed sink with
+  `simulationManager.setSink(realtimeSimulationSink())` after `initWebsocket()` —
+  a sink that resolves the current service per event, so a close/re-init cannot
+  leave the engine emitting into a torn-down server. `RealtimeService` is the
+  **only** module that may call Socket.IO — domain code emits a `RealtimeEvent`
+  and lets it choose the rooms.
+- **Realtime events are emitted by name**, one Socket.IO event per type, with the
+  payload as the single argument. The `{ type, data }` form exists only inside the
+  process as `RealtimeEvent`, the tagged union `RealtimeService.emit()` routes on.
+  Adding an event means a member in `src/websocket/events.ts`, a case in
+  `roomsFor()`, and a row in `api-docs/realtime.md` — nothing else.
+- **Nothing crosses the wire as a `Date`.** Socket.IO JSON-serialises acks, so
+  snapshots are wire-shaped: `LiveTruckWireView` = `Wire<LiveTruckView>` and
+  `snapshots.ts` stringifies the timestamps itself rather than letting the
+  serialiser do it behind a type that still says `Date`.
+- **`sequenceNumber` survives a reset.** Clients drop updates below their
+  high-water mark, so `SimulationManager` keeps a per-truck counter across
+  `live.clear()` and hands it back to `toLiveState` on reload.
+- **Socket handlers answer through the ack, never by throwing.** An exception in a
+  socket handler takes the connection (or the process) down instead of returning a
+  400, so `subscribe:*` validates with `safeParse` and replies
+  `{ ok: false, error }`. The ack is also optional on the wire — check it is a
+  function before calling it.
 - **ETA holds steady under constant speed — that is correct.** `calculateEta`
   returns an absolute wall-clock instant, so what counts down is the time
   remaining, not the timestamp. An arrival time that drifts while the truck keeps

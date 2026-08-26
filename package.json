@@ -1,7 +1,7 @@
 {
   "name": "warehouse-management-server",
   "version": "1.0.0",
-  "description": "Backend for E2: Where's My Truck? — real-time warehouse execution / control-tower system",
+  "description": "Backend for E2: Where's My Truck? \u2014 real-time warehouse execution / control-tower system",
   "main": "dist/server.js",
   "scripts": {
     "dev": "tsx watch src/server.ts",
@@ -11,6 +11,7 @@
     "typecheck:test": "tsc -p tsconfig.test.json --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",
+    "realtime:demo": "tsx scripts/realtime-client.ts",
     "clean": "rm -rf dist",
     "prisma:generate": "prisma generate",
     "prisma:migrate": "prisma migrate dev",
@@ -45,6 +46,7 @@
     "@types/pg": "^8.23.1",
     "@types/supertest": "^7.2.1",
     "prisma": "7.10.0",
+    "socket.io-client": "^4.8.3",
     "supertest": "^7.2.2",
     "tsx": "^4.23.12",
     "typescript": "^7.0.2",

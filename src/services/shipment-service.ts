@@ -143,3 +143,23 @@ export async function getShipmentByReference(reference: string) {
   }
   return shipment;
 }
+
+/**
+ * The minimum a realtime subscriber needs: the canonical shipment id (so the
+ * room name is stable however the client addressed it) and the truck carrying
+ * it. Accepts id, `reference` or `trackingNumber` — a customer clicking a
+ * tracking link has the last of those. Returns `null` rather than throwing,
+ * because the caller is a socket handler that answers through an ack.
+ */
+export async function resolveShipmentTruck(
+  idOrReference: string,
+): Promise<{ shipmentId: string; truckId: string } | null> {
+  const select = { id: true, truckId: true } as const;
+
+  const shipment =
+    (await prisma.shipment.findUnique({ where: { id: idOrReference }, select })) ??
+    (await prisma.shipment.findUnique({ where: { reference: idOrReference }, select })) ??
+    (await prisma.shipment.findUnique({ where: { trackingNumber: idOrReference }, select }));
+
+  return shipment === null ? null : { shipmentId: shipment.id, truckId: shipment.truckId };
+}
