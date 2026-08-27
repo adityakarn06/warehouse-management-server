@@ -6,7 +6,7 @@ const adapter = new PrismaPg({ connectionString: env.DATABASE_URL });
 
 export const prisma = new PrismaClient({
   adapter,
-  log: env.isProduction ? ['warn', 'error'] : ['query', 'warn', 'error'],
+  log: ['warn', 'error'],
 });
 
 export async function pingDatabase(): Promise<void> {
