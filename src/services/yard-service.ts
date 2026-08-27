@@ -1,6 +1,8 @@
+import type { DockStatus } from '../generated/prisma/enums.js';
 import { env } from '../config/index.js';
 import { prisma } from '../lib/prisma.js';
 import type {
+  AllocationSummaryResponse,
   YardAlert,
   YardDock,
   YardDockAssignment,
@@ -231,5 +233,88 @@ export async function getYardOverview(): Promise<YardOverview> {
     docks,
     activeAssignments: assignmentRows.map(toYardAssignment),
     alerts,
+  };
+}
+
+// --- Trailer-to-door allocation summary (problem statement §7 output) --
+
+const DOCK_STATUSES: DockStatus[] = ['AVAILABLE', 'RESERVED', 'OCCUPIED', 'UNAVAILABLE'];
+
+/**
+ * "Trailer-to-door allocation summary" — who has a door and who does not, in
+ * one glance. Committed-only (`committedAssignmentWhere`): a `RECOMMENDED` row
+ * is a proposal, not an allocation.
+ */
+export async function getAllocationSummary(now = new Date()): Promise<AllocationSummaryResponse> {
+  const [assignments, unassignedTrucks, dockCounts] = await prisma.$transaction([
+    prisma.dockAssignment.findMany({
+      where: committedAssignmentWhere,
+      orderBy: assignmentRecencyOrder,
+      select: {
+        id: true,
+        status: true,
+        scheduledStart: true,
+        scheduledEnd: true,
+        previousAssignmentId: true,
+        truck: { select: { id: true, reference: true, trailerId: true } },
+        shipment: { select: { reference: true, priority: true, loadType: true } },
+        dockDoor: { select: { id: true, code: true, zone: true } },
+      },
+    }),
+    prisma.truck.findMany({
+      where: {
+        status: { not: 'COMPLETED' },
+        dockAssignments: { none: committedAssignmentWhere },
+      },
+      orderBy: { reference: 'asc' },
+      select: {
+        id: true,
+        reference: true,
+        trailerId: true,
+        status: true,
+        shipment: { select: { reference: true, priority: true } },
+      },
+    }),
+    prisma.dockDoor.groupBy({ by: ['status'], _count: { _all: true } }),
+  ]);
+
+  const docksByStatus = Object.fromEntries(
+    DOCK_STATUSES.map((status) => [status, 0]),
+  ) as Record<DockStatus, number>;
+  for (const row of dockCounts) {
+    docksByStatus[row.status] = row._count._all;
+  }
+
+  return {
+    generatedAt: now.toISOString(),
+    totals: {
+      allocatedTrailers: assignments.length,
+      unallocatedTrailers: unassignedTrucks.length,
+      docksByStatus,
+    },
+    allocations: assignments.map((row) => ({
+      assignmentId: row.id,
+      status: row.status,
+      trailerId: row.truck.trailerId,
+      truckId: row.truck.id,
+      truckReference: row.truck.reference,
+      shipmentReference: row.shipment?.reference ?? null,
+      priority: row.shipment?.priority ?? null,
+      loadType: row.shipment?.loadType ?? null,
+      dockId: row.dockDoor.id,
+      dockCode: row.dockDoor.code,
+      zone: row.dockDoor.zone,
+      scheduledStart: row.scheduledStart?.toISOString() ?? null,
+      scheduledEnd: row.scheduledEnd?.toISOString() ?? null,
+      chainedFrom: row.previousAssignmentId,
+    })),
+    unallocated: unassignedTrucks.map((truck) => ({
+      truckId: truck.id,
+      truckReference: truck.reference,
+      trailerId: truck.trailerId,
+      status: truck.status,
+      shipmentReference: truck.shipment?.reference ?? null,
+      priority: truck.shipment?.priority ?? null,
+    })),
   };
 }

@@ -311,6 +311,54 @@ Still empty placeholder directory: `src/alerts` (alert logic lives in
 `src/services/alert-service.ts`).
 Sections 15, 24 and 27–31 below describe the target system, not the code on disk.
 
+**Post-Phase-10: closing the gaps against `docs/problemStatement.md`.** An
+audit against the hackathon brief found four things Phases 1–10 left out; all
+four are closed now, with no migration and no new realtime event.
+
+```text
+src/services/docking-queue-service.ts   the arrival-window docking queue
+```
+
+- **Unified identifier lookup (§1).** `GET /api/v1/tracking/:trackingNumber`
+  now resolves a tracking number, a shipment reference, a shipment id, or a
+  truck's `trailerId`, in that order (`findShipmentByIdentifier` in
+  `src/services/tracking-service.ts`); the response's `resolvedBy` field says
+  which arm matched. `getTruckById` (`src/services/truck-service.ts`) grew the
+  same third `trailerId` arm, so `GET /api/v1/trucks/TRL-101` resolves too.
+- **Arrival-window docking queue (§4).** `GET /api/v1/yard/docking-queue`
+  buckets trucks that are `ARRIVING`/`ARRIVED` or have an appointment inside
+  `ARRIVAL_HORIZON_MINUTES`, and hold no committed door, by appointment window,
+  and attaches each one's top `recommendDocks` result. Read-only — the operator
+  still presses assign (§2); nothing here writes a `RECOMMENDED` row or commits
+  a door. `src/docking` stays the write side, so this new service lives under
+  `src/services`.
+- **Dock-door assignment schedule + trailer-to-door allocation summary (§7
+  outputs).** `GET /api/v1/docks/schedule` (`getDockSchedule` in
+  `src/services/dock-service.ts`) is a forward-looking, per-dock timeline —
+  ordered `scheduledStart: asc`, committed-only by default
+  (`?includeRecommended=true` opts into `RECOMMENDED` rows too) — as opposed to
+  `GET /docks/:id`'s recency-ordered single-door history. Registered ahead of
+  `/docks/:id` in `src/routes/docks.routes.ts`, or Express would match
+  `schedule` as a dock id. `GET /api/v1/yard/allocation-summary`
+  (`getAllocationSummary` in `src/services/yard-service.ts`) is the
+  trailer-to-door rollup, with a `totals` block and an `unallocated` list, and a
+  `chainedFrom` field reading `previousAssignmentId` so a reassigned trailer
+  shows where it came from.
+- **`TRUCK_ARRIVING` alerts from the simulation loop.** The only writer used to
+  be the WMS feed's `TRAILER_STATUS_UPDATED` handler
+  (`src/wms/wms-event-handler.ts`) — a truck reaching `ARRIVING` purely by
+  ticking raised no alert. `SimulationManager.raiseArrivingAlert`
+  (`src/simulation/simulation-manager.ts`), modelled directly on
+  `raiseDelayAlert`, now fires once on the tick `advanceTruck` flips the status,
+  writes through the injected `store.createAlert` seam, and emits
+  `ALERT_CREATED` through the sink — the engine still never touches Socket.IO
+  itself (§14). A lost write is logged, not fatal, same rule as the delay path.
+
+New tests: `tests/reporting.test.ts` (read-only, supertest against the seeded
+database, same convention as `read-api.test.ts`) and one case in
+`tests/simulation.test.ts` driving `manager.tick()` past the `ARRIVING`
+threshold with a fake store/sink.
+
 ## Conventions that are easy to get wrong
 
 - **ESM with `verbatimModuleSyntax`.** `"type": "module"` + `module: nodenext`,

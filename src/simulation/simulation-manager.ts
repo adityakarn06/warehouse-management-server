@@ -592,6 +592,51 @@ export class SimulationManager {
     }
   }
 
+  /**
+   * `TRUCK_ARRIVING` (CLAUDE.md §11). The WMS feed already raises this on
+   * `TRAILER_STATUS_UPDATED`; this is the mirror for a truck that reaches
+   * `ARRIVING` by simulation ticks rather than an external report, so the
+   * demo's "ETA alerts" output has a trigger on the normal happy path too.
+   * Fires once, on the tick `advanceTruck` flips the status — never on a
+   * later tick that merely holds `ARRIVING`.
+   */
+  private async raiseArrivingAlert(next: LiveTruckState): Promise<void> {
+    try {
+      const etaMinutes =
+        next.eta === null ? null : Math.round((next.eta.getTime() - this.deps.now()) / 60_000);
+
+      const alert = await this.deps.store.createAlert({
+        type: 'TRUCK_ARRIVING',
+        severity: 'INFO',
+        title: `${next.reference} is arriving`,
+        message:
+          etaMinutes === null
+            ? `${next.reference} is arriving now.`
+            : `${next.reference} is arriving in about ${etaMinutes} min.`,
+        truckId: next.truckId,
+        shipmentId: next.shipmentId,
+        metadata: { progress: round(next.progress), ...(etaMinutes === null ? {} : { etaMinutes }) },
+      });
+
+      const payload: AlertCreatedPayload = {
+        alertId: alert.id,
+        type: alert.type,
+        severity: alert.severity,
+        title: alert.title,
+        message: alert.message,
+        truckId: alert.truckId,
+        shipmentId: alert.shipmentId,
+        dockDoorId: alert.dockDoorId,
+        createdAt: alert.createdAt.toISOString(),
+      };
+
+      this.deps.sink.emit({ type: 'ALERT_CREATED', data: payload });
+    } catch (error) {
+      // Same rule as the delay alert: a lost audit row must not fail the tick.
+      logger.error(`Failed to raise arriving alert for ${next.reference}`, error);
+    }
+  }
+
   // --- External facts: the WMS feed (CLAUDE.md §15) -------------------------
 
   /**
@@ -820,6 +865,9 @@ export class SimulationManager {
     this.emitPosition(next, profile);
     if (result.etaChanged) this.emitEta(next);
     if (result.statusChanged) this.emitStatus(next, result.previousStatus);
+    if (result.statusChanged && next.status === 'ARRIVING') {
+      await this.raiseArrivingAlert(next);
+    }
 
     const reason = this.snapshotReason(next, result.statusChanged, result.arrived);
     if (reason !== null || result.statusChanged) {

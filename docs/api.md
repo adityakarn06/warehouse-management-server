@@ -114,12 +114,19 @@ The customer-facing endpoint. Hand-shaped and flat — no raw Prisma rows.
 `appointmentWindow` and `assignedDock` are `null` when absent. `assignedDock`
 reflects a committed (`ASSIGNED`) assignment only — never a recommendation.
 
+Despite the path segment, `:trackingNumber` accepts any of four identifiers
+(problem statement §1) — a tracking number, a shipment reference, a shipment
+id, or a truck's trailer id — tried in that order and stopping at the first
+match. `resolvedBy` in the response names which arm matched:
+`TRACKING_NUMBER` | `SHIPMENT_REFERENCE` | `SHIPMENT_ID` | `TRAILER_ID`.
+
 ```jsonc
 {
   "data": {
     "reference": "SHP-1001",
     "trackingNumber": "E2-TRACK-101",
     "trailerId": "TRL-101",
+    "resolvedBy": "TRACKING_NUMBER",
     "customerName": "FreshMart Retail Pvt Ltd",
     "status": "IN_TRANSIT",
     "truckStatus": "IN_TRANSIT",
@@ -153,7 +160,9 @@ reflects a committed (`ASSIGNED`) assignment only — never a recommendation.
 
 Detail rows include the route (no geometry), the shipment and its appointment,
 all dock assignments newest-first, and the 20 most recent `LocationHistory`
-snapshots.
+snapshots. `:id` accepts a truck's own id, its `reference` (`TRK-101`), or its
+`trailerId` (`TRL-101`) — same fallback order as every other id-or-natural-key
+lookup in the API.
 
 ### Routes
 
@@ -169,6 +178,7 @@ Returns the full route **including `geometry`** — an array of
 | Method | Path | Query params |
 | --- | --- | --- |
 | `GET` | `/api/v1/docks` | `status`, `zone`, `loadType`, `limit`, `offset` |
+| `GET` | `/api/v1/docks/schedule` | `from`, `to`, `includeRecommended` |
 | `GET` | `/api/v1/docks/:id` | — |
 | `PATCH` | `/api/v1/docks/:id/status` | — (JSON body) |
 | `POST` | `/api/v1/docks/:id/release` | — |
@@ -181,6 +191,49 @@ List rows include the dock's current assignment — `ASSIGNED` only, since a
 occupied. Assignment history on the detail route is capped at the 20 most recent.
 Detail rows include the full assignment history and the dock's unacknowledged
 alerts.
+
+#### `GET /api/v1/docks/schedule`
+
+The dock-door assignment schedule (problem statement §7 output) — a
+forward-looking timeline per door, as opposed to `GET /docks/:id`'s
+recency-ordered history for a single door. Registered ahead of `/docks/:id` so
+`schedule` is never matched as a dock id.
+
+- `from` / `to`: ISO datetimes bounding the window. Default `from` is now,
+  `to` is `now + ARRIVAL_HORIZON_MINUTES`.
+- `includeRecommended`: `"true"` also lists `RECOMMENDED` rows. Defaults to
+  `false` — committed (`ASSIGNED`) only, so the schedule never shows a proposal
+  as a booking.
+
+An assignment with no `scheduledStart`/`scheduledEnd` (both nullable) always
+appears regardless of `from`/`to`, on the same reasoning the assignment engine
+itself uses when checking for a clash: no window does not mean no booking, and
+excluding it would let a door that is actually taken read as free on the
+schedule.
+
+```jsonc
+{
+  "data": {
+    "generatedAt": "2026-08-27T17:00:00.000Z",
+    "from": "2026-08-27T17:00:00.000Z",
+    "to": "2026-08-27T19:00:00.000Z",
+    "includeRecommended": false,
+    "docks": [
+      {
+        "dockId": "D2", "dockCode": "D2", "dockName": "Dock Door 2 (reefer)",
+        "zone": "NORTH", "status": "RESERVED",
+        "assignments": [
+          { "id": "DA-3002", "status": "ASSIGNED", "truckId": "TRK-101",
+            "truckReference": "TRK-101", "trailerId": "TRL-101",
+            "shipmentReference": "SHP-1001", "priority": "HIGH", "loadType": "REFRIGERATED",
+            "score": 91, "reasons": ["..."],
+            "scheduledStart": "2026-08-27T17:15:00.000Z", "scheduledEnd": "2026-08-27T18:15:00.000Z" }
+        ]
+      }
+    ]
+  }
+}
+```
 
 #### `PATCH /api/v1/docks/:dockId/status` (Phase 7, cascade in Phase 8)
 
@@ -415,7 +468,10 @@ assignment it superseded.
 - `severity`: `INFO` `WARNING` `CRITICAL`
 - `acknowledged`: `true` or `false` (exact strings — anything else is a `400`)
 
-Ordered newest-first.
+Ordered newest-first. `TRUCK_ARRIVING` is written from two independent paths —
+`SimulationManager` itself, the tick a truck's status crosses into `ARRIVING`,
+and the WMS feed's `TRAILER_STATUS_UPDATED` — so it fires whether a truck is
+being driven by the simulation loop or reported on by an external system.
 
 ### Yard overview
 
@@ -445,6 +501,83 @@ so every section describes the same moment.
 ```
 
 `ARRIVAL_HORIZON_MINUTES` (default `120`) is configurable via the environment.
+
+### Docking queue
+
+| Method | Path |
+| --- | --- |
+| `GET` | `/api/v1/yard/docking-queue` |
+
+"Identify the trailer that needs to be docked for each arrival window"
+(problem statement §4). Trucks that are `ARRIVING`/`ARRIVED`, or whose
+appointment window opens within `ARRIVAL_HORIZON_MINUTES` **and has not yet
+closed**, and that hold no committed door yet — grouped into buckets by
+appointment window (`windowStart`/`windowEnd`, `null` for the `UNSCHEDULED`
+bucket), sorted by window then priority then ETA. A window whose `windowEnd`
+has already passed drops out of the queue rather than pinning a stuck truck in
+it forever. Each entry carries only its **top** ranked dock recommendation (via
+`recommendDocks`, side-effect free — this never writes a `RECOMMENDED` row).
+The operator still presses assign; nothing here commits a door (§2).
+
+Recommendations are fetched concurrently across a window's entries.
+`topRecommendation` is `null` both when the scorer excludes every door (e.g. an
+oversized load with no oversized door free — Scenario E) and, defensively, if
+scoring that one truck fails for any reason — one bad entry never fails the
+whole request.
+
+```jsonc
+{
+  "data": {
+    "generatedAt": "2026-08-27T17:00:00.000Z",
+    "horizonMinutes": 120,
+    "windows": [
+      {
+        "windowStart": "2026-08-27T18:05:00.000Z", "windowEnd": "2026-08-27T18:50:00.000Z",
+        "entries": [
+          { "truckId": "...", "truckReference": "TRK-112", "trailerId": "TRL-112",
+            "status": "DELAYED", "eta": "...", "progress": 96.8,
+            "shipmentReference": "SHP-1012", "priority": "LOW", "loadType": "GENERAL",
+            "topRecommendation": { "dockId": "D3", "dockCode": "D3", "score": 88, "reasons": ["..."] } }
+        ]
+      }
+    ]
+  }
+}
+```
+
+### Allocation summary
+
+| Method | Path |
+| --- | --- |
+| `GET` | `/api/v1/yard/allocation-summary` |
+
+The trailer-to-door allocation summary (problem statement §7 output).
+Committed (`ASSIGNED`) assignments only, plus every active truck holding none.
+`chainedFrom` carries the assignment this one superseded — set only when the
+truck arrived at its door through the reassignment chain (§10), otherwise
+`null`.
+
+```jsonc
+{
+  "data": {
+    "generatedAt": "2026-08-27T17:00:00.000Z",
+    "totals": {
+      "allocatedTrailers": 3, "unallocatedTrailers": 8,
+      "docksByStatus": { "AVAILABLE": 3, "RESERVED": 2, "OCCUPIED": 2, "UNAVAILABLE": 1 }
+    },
+    "allocations": [
+      { "assignmentId": "DA-3006", "status": "ASSIGNED", "trailerId": "TRL-107",
+        "truckId": "TRK-107", "truckReference": "TRK-107", "shipmentReference": "SHP-1007",
+        "priority": "HIGH", "loadType": "GENERAL", "dockId": "D8", "dockCode": "D8", "zone": "SOUTH",
+        "scheduledStart": "...", "scheduledEnd": "...", "chainedFrom": "DA-3005" }
+    ],
+    "unallocated": [
+      { "truckId": "...", "truckReference": "TRK-102", "trailerId": "TRL-102",
+        "status": "IN_TRANSIT", "shipmentReference": "SHP-1002", "priority": "MEDIUM" }
+    ]
+  }
+}
+```
 
 ---
 

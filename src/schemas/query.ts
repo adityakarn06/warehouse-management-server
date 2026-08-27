@@ -49,3 +49,9 @@ export const alertListQuerySchema = paginationSchema.extend({
 
 export const referenceParamSchema = z.object({ reference: z.string().min(1) });
 export const trackingNumberParamSchema = z.object({ trackingNumber: z.string().min(1) });
+
+export const dockScheduleQuerySchema = z.object({
+  from: z.iso.datetime().optional(),
+  to: z.iso.datetime().optional(),
+  includeRecommended: booleanQuery.optional(),
+});

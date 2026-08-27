@@ -1,11 +1,12 @@
 import type { Request, Response } from 'express';
 import { releaseDock } from '../docking/dock-assignment-service.js';
 import { sendData, sendList } from '../lib/api-response.js';
+import { compact } from '../lib/object.js';
 import { parseBody, parseParams, parseQuery } from '../lib/validate.js';
 import { idParamSchema } from '../schemas/common.js';
 import { dockStatusCommandSchema } from '../schemas/docking.js';
-import { dockListQuerySchema } from '../schemas/query.js';
-import { getDockById, listDocks, setDockStatus } from '../services/dock-service.js';
+import { dockListQuerySchema, dockScheduleQuerySchema } from '../schemas/query.js';
+import { getDockById, getDockSchedule, listDocks, setDockStatus } from '../services/dock-service.js';
 
 export async function getDocks(req: Request, res: Response): Promise<void> {
   const query = parseQuery(dockListQuerySchema, req);
@@ -16,6 +17,23 @@ export async function getDocks(req: Request, res: Response): Promise<void> {
 export async function getDock(req: Request, res: Response): Promise<void> {
   const { id } = parseParams(idParamSchema, req);
   sendData(res, await getDockById(id));
+}
+
+/** The dock-door assignment schedule (problem statement §7 output): a
+ * forward-looking, per-dock timeline rather than the single-door history
+ * `getDockById` returns. */
+export async function getDockScheduleHandler(req: Request, res: Response): Promise<void> {
+  const query = parseQuery(dockScheduleQuerySchema, req);
+  sendData(
+    res,
+    await getDockSchedule(
+      compact({
+        from: query.from !== undefined ? new Date(query.from) : undefined,
+        to: query.to !== undefined ? new Date(query.to) : undefined,
+        includeRecommended: query.includeRecommended,
+      }),
+    ),
+  );
 }
 
 /**

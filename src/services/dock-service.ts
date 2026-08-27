@@ -1,3 +1,4 @@
+import { env } from '../config/index.js';
 import { handleDockFailure } from '../docking/dock-failure-service.js';
 import type { ReassignmentOutcome } from '../docking/dock-failure-service.js';
 import {
@@ -10,10 +11,12 @@ import { HttpError } from '../lib/http-error.js';
 import { logger } from '../lib/logger.js';
 import { compact } from '../lib/object.js';
 import { prisma } from '../lib/prisma.js';
-import type { Pagination } from '../types/api.js';
+import type { DockScheduleResponse, Pagination } from '../types/api.js';
 import type { AlertCreatedPayload } from '../websocket/events.js';
 import { createAlert } from './alert-service.js';
 import {
+  ACTIVE_ASSIGNMENT_STATUSES,
+  COMMITTED_ASSIGNMENT_STATUSES,
   assignmentRecencyOrder,
   committedAssignmentWhere,
   truckSummarySelect,
@@ -328,5 +331,95 @@ export async function setDockStatus(
     affectedAssignments: dock.assignments,
     alert,
     reassignments,
+  };
+}
+
+// --- Dock-door assignment schedule (problem statement §7 output) -------
+
+const scheduleAssignmentSelect = {
+  id: true,
+  status: true,
+  score: true,
+  reasons: true,
+  scheduledStart: true,
+  scheduledEnd: true,
+  truck: { select: { id: true, reference: true, trailerId: true } },
+  shipment: { select: { reference: true, priority: true, loadType: true } },
+} as const;
+
+export interface DockScheduleFilters {
+  from?: Date | undefined;
+  to?: Date | undefined;
+  includeRecommended?: boolean | undefined;
+}
+
+/**
+ * A forward-looking, per-dock timeline — as opposed to `getDockById`, which is
+ * a single door's *history* ordered by recency. Defaults to committed
+ * (`ASSIGNED`) rows only, matching every other read on this door: a
+ * `RECOMMENDED` row is a proposal, never a booking on the board.
+ */
+export async function getDockSchedule(
+  filters: DockScheduleFilters = {},
+  now = new Date(),
+): Promise<DockScheduleResponse> {
+  const from = filters.from ?? now;
+  const to = filters.to ?? new Date(now.getTime() + env.ARRIVAL_HORIZON_MINUTES * 60_000);
+  const includeRecommended = filters.includeRecommended ?? false;
+
+  const statuses = includeRecommended ? ACTIVE_ASSIGNMENT_STATUSES : COMMITTED_ASSIGNMENT_STATUSES;
+
+  const docks = await prisma.dockDoor.findMany({
+    orderBy: { code: 'asc' },
+    select: {
+      id: true,
+      code: true,
+      name: true,
+      zone: true,
+      status: true,
+      assignments: {
+        where: {
+          status: { in: statuses },
+          // A null scheduledStart/End is not "no window" — `dockStillTakes` in
+          // the assignment engine treats it as occupying the door outright, so
+          // the schedule must show it too, or a booked door reads as free here.
+          OR: [
+            { scheduledStart: { lte: to }, scheduledEnd: { gte: from } },
+            { scheduledStart: null },
+            { scheduledEnd: null },
+          ],
+        },
+        orderBy: { scheduledStart: 'asc' },
+        select: scheduleAssignmentSelect,
+      },
+    },
+  });
+
+  return {
+    generatedAt: now.toISOString(),
+    from: from.toISOString(),
+    to: to.toISOString(),
+    includeRecommended,
+    docks: docks.map((dock) => ({
+      dockId: dock.id,
+      dockCode: dock.code,
+      dockName: dock.name,
+      zone: dock.zone,
+      status: dock.status,
+      assignments: dock.assignments.map((row) => ({
+        id: row.id,
+        status: row.status,
+        truckId: row.truck.id,
+        truckReference: row.truck.reference,
+        trailerId: row.truck.trailerId,
+        shipmentReference: row.shipment?.reference ?? null,
+        priority: row.shipment?.priority ?? null,
+        loadType: row.shipment?.loadType ?? null,
+        score: row.score,
+        reasons: row.reasons,
+        scheduledStart: row.scheduledStart?.toISOString() ?? null,
+        scheduledEnd: row.scheduledEnd?.toISOString() ?? null,
+      })),
+    })),
   };
 }

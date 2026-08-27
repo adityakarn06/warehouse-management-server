@@ -134,6 +134,12 @@ export async function getTruckById(idOrReference: string) {
   });
   if (byReference) return byReference;
 
+  const byTrailerId = await prisma.truck.findUnique({
+    where: { trailerId: idOrReference },
+    select,
+  });
+  if (byTrailerId) return byTrailerId;
+
   throw HttpError.notFound(`Truck ${idOrReference} was not found`);
 }
 

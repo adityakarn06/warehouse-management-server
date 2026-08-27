@@ -387,6 +387,30 @@ describe('simulation manager', () => {
     await h.manager.stop();
   });
 
+  it('raises exactly one TRUCK_ARRIVING alert on the transition into ARRIVING', async () => {
+    const h = harness();
+    await h.manager.start();
+
+    for (let i = 0; i < 200 && h.manager.getTruckState('TRK-TEST')?.status !== 'ARRIVING'; i += 1) {
+      await h.advance(ONE_HOUR / 60);
+    }
+
+    expect(h.manager.getTruckState('TRK-TEST')?.status).toBe('ARRIVING');
+    expect(h.store.alerts).toHaveLength(1);
+    expect(h.store.alerts[0]?.type).toBe('TRUCK_ARRIVING');
+    expect(h.store.alerts[0]?.truckId).toBe('TRK-TEST');
+    expect(h.sink.ofType('ALERT_CREATED')).toHaveLength(1);
+    expect(h.sink.ofType('ALERT_CREATED')[0]?.data.type).toBe('TRUCK_ARRIVING');
+
+    // Holding in ARRIVING on later ticks must not raise a second alert.
+    await h.advance(ONE_HOUR / 60);
+    await h.advance(ONE_HOUR / 60);
+    expect(h.store.alerts).toHaveLength(1);
+    expect(h.sink.ofType('ALERT_CREATED')).toHaveLength(1);
+
+    await h.manager.stop();
+  });
+
   it('never writes a row per tick', async () => {
     // 5% checkpoint step; each tick covers 0.03% at 60 km/h on a 100 km route.
     const h = harness([truckRow()], 5);

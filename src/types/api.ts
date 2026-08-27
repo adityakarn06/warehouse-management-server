@@ -64,6 +64,13 @@ export interface AssignedDock {
   scheduledEnd: string | null;
 }
 
+/** Which identifier arm actually matched (§1 of the problem statement). */
+export type TrackingResolvedBy =
+  | 'TRACKING_NUMBER'
+  | 'SHIPMENT_REFERENCE'
+  | 'SHIPMENT_ID'
+  | 'TRAILER_ID';
+
 /**
  * Customer-facing tracking payload. Deliberately flat and hand-shaped — no raw
  * Prisma rows leak through this endpoint.
@@ -72,6 +79,7 @@ export interface TrackingResponse {
   reference: string;
   trackingNumber: string;
   trailerId: string;
+  resolvedBy: TrackingResolvedBy;
   customerName: string;
   status: ShipmentStatus;
   truckStatus: TruckStatus;
@@ -183,4 +191,115 @@ export interface YardOverview {
   docks: YardDock[];
   activeAssignments: YardDockAssignment[];
   alerts: YardAlert[];
+}
+
+/* ------------------------------------------------------- docking queue */
+
+export interface DockingQueueRecommendation {
+  dockId: string;
+  dockCode: string;
+  score: number;
+  reasons: string[];
+}
+
+export interface DockingQueueEntry {
+  truckId: string;
+  truckReference: string;
+  trailerId: string;
+  status: TruckStatus;
+  eta: string | null;
+  progress: number;
+  shipmentReference: string | null;
+  priority: Priority | null;
+  loadType: LoadType | null;
+  topRecommendation: DockingQueueRecommendation | null;
+}
+
+export interface DockingQueueWindow {
+  /** `null` for the UNSCHEDULED bucket — trucks with no appointment. */
+  windowStart: string | null;
+  windowEnd: string | null;
+  entries: DockingQueueEntry[];
+}
+
+export interface DockingQueueResponse {
+  generatedAt: string;
+  horizonMinutes: number;
+  windows: DockingQueueWindow[];
+}
+
+/* -------------------------------------------------------- dock schedule */
+
+export interface DockScheduleAssignment {
+  id: string;
+  status: AssignmentStatus;
+  truckId: string;
+  truckReference: string;
+  trailerId: string;
+  shipmentReference: string | null;
+  priority: Priority | null;
+  loadType: LoadType | null;
+  score: number | null;
+  reasons: string[];
+  scheduledStart: string | null;
+  scheduledEnd: string | null;
+}
+
+export interface DockScheduleEntry {
+  dockId: string;
+  dockCode: string;
+  dockName: string;
+  zone: string;
+  status: DockStatus;
+  assignments: DockScheduleAssignment[];
+}
+
+export interface DockScheduleResponse {
+  generatedAt: string;
+  from: string;
+  to: string;
+  includeRecommended: boolean;
+  docks: DockScheduleEntry[];
+}
+
+/* -------------------------------------------------- allocation summary */
+
+export interface AllocationEntry {
+  assignmentId: string;
+  status: AssignmentStatus;
+  trailerId: string;
+  truckId: string;
+  truckReference: string;
+  shipmentReference: string | null;
+  priority: Priority | null;
+  loadType: LoadType | null;
+  dockId: string;
+  dockCode: string;
+  zone: string;
+  scheduledStart: string | null;
+  scheduledEnd: string | null;
+  /** The assignment this one superseded, when it arrived via the reassignment chain. */
+  chainedFrom: string | null;
+}
+
+export interface UnallocatedTrailer {
+  truckId: string;
+  truckReference: string;
+  trailerId: string;
+  status: TruckStatus;
+  shipmentReference: string | null;
+  priority: Priority | null;
+}
+
+export interface AllocationTotals {
+  allocatedTrailers: number;
+  unallocatedTrailers: number;
+  docksByStatus: Record<DockStatus, number>;
+}
+
+export interface AllocationSummaryResponse {
+  generatedAt: string;
+  totals: AllocationTotals;
+  allocations: AllocationEntry[];
+  unallocated: UnallocatedTrailer[];
 }
