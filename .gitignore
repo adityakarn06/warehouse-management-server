@@ -8,6 +8,7 @@ dist
 
 # generated prisma client
 src/generated
+/trash
 
 # misc
 *.log
