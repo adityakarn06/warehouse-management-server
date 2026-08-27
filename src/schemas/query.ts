@@ -47,6 +47,12 @@ export const alertListQuerySchema = paginationSchema.extend({
   dockDoorId: z.string().min(1).optional(),
 });
 
+export const fleetListQuerySchema = paginationSchema.extend({
+  status: truckStatusSchema.optional(),
+  activeDelay: delayScenarioSchema.optional(),
+  search: z.string().min(1).optional(),
+});
+
 export const referenceParamSchema = z.object({ reference: z.string().min(1) });
 export const trackingNumberParamSchema = z.object({ trackingNumber: z.string().min(1) });
 

@@ -164,6 +164,61 @@ snapshots. `:id` accepts a truck's own id, its `reference` (`TRK-101`), or its
 `trailerId` (`TRL-101`) — same fallback order as every other id-or-natural-key
 lookup in the API.
 
+### Fleet
+
+| Method | Path | Query params |
+| --- | --- | --- |
+| `GET` | `/api/v1/fleet` | `status`, `activeDelay`, `search`, `limit`, `offset` |
+
+One denormalized row per truck for the frontend's `/fleet` card grid, so it
+does not have to join `/trucks` + `/shipments` + `/docks` client-side. Pure
+projection — no new business logic, no new Socket.IO event; poll it
+(`refetchInterval`) rather than subscribing, the way `docs/fleet.md` specifies.
+
+- `status`: `IN_TRANSIT` `DELAYED` `ARRIVING` `ARRIVED` `DOCKED` `COMPLETED`
+- `activeDelay`: `NORMAL` `RAIN` `TRAFFIC` `ROAD_CLOSURE`
+- `search`: case-insensitive substring match over `reference` and `trailerId`
+- `limit` default `50`, max `200`; `offset` default `0`
+
+`shipment` and `dock` are independently nullable. `dock` surfaces only the
+truck's `ASSIGNED` assignment, never a `RECOMMENDED` one — same rule as every
+other "current assignment" view in this API.
+
+```jsonc
+{
+  "data": [
+    {
+      "id": "TRK-101", "reference": "TRK-101", "trailerId": "TRL-101",
+      "carrier": "Northline Freight", "driverName": "Rajesh Kumar",
+      "driverPhone": "+91 98100 11201",
+      "status": "IN_TRANSIT", "activeDelay": "NORMAL",
+      "progress": 68.49, "speedKmph": 58,
+      "eta": "2026-08-28T03:52:01.692Z", "lastUpdatedAt": "2026-08-27T19:46:19.190Z",
+      "route": {
+        "id": "RTE-DEL-KOL-01", "code": "RTE-DEL-KOL-01",
+        "name": "Delhi NCR → Kolkata (NH-19 corridor)",
+        "originName": "Delhi NCR Hub, Delhi", "destinationName": "E2 Fulfilment Centre, Kolkata",
+        "distanceKm": 1490
+      },
+      "shipment": {
+        "id": "SHP-1001", "reference": "SHP-1001", "trackingNumber": "E2-TRACK-101",
+        "customerName": "FreshMart Retail Pvt Ltd",
+        "status": "IN_TRANSIT", "priority": "HIGH", "loadType": "REFRIGERATED",
+        "weightKg": 14200, "palletCount": 22
+      },
+      "dock": {
+        "id": "D2", "code": "D2", "name": "Dock Door 2 (reefer)", "zone": "NORTH",
+        "assignmentId": "DA-3002", "assignmentStatus": "ASSIGNED"
+      }
+    }
+  ],
+  "meta": { "total": 12, "limit": 50, "offset": 0 }
+}
+```
+
+Full contract proposal (including the rationale for shape choices):
+`docs/fleet.md`.
+
 ### Routes
 
 | Method | Path |

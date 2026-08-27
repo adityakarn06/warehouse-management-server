@@ -69,6 +69,8 @@ message broker and no second service.
 Note there are two files named `dock-assignment-service.ts` on purpose:
 `src/services/` only *lists* assignment rows for `GET /api/v1/dock-assignments`,
 while `src/docking/` owns every consequence of a recommendation being taken.
+`src/services/docking-queue-service.ts` (§8) stays on the reads side for the
+same reason: it calls the write side's `recommendDocks` but never writes.
 
 ---
 
@@ -316,6 +318,59 @@ from `DOCKED` or restamps `arrivedAt`.
 
 ---
 
+## Decision 8 — the reporting surface reads, never decides
+
+An audit against `docs/problemStatement.md` after Phase 10 found four things
+the brief asks for that had no endpoint: resolving a trailer id (only a
+tracking number or shipment reference worked), a view of which trailers need a
+door for each arrival window, a forward-looking per-dock schedule, a
+trailer-to-door allocation summary, and an `ARRIVING` alert for a truck the
+simulation itself drives there rather than one reported by the WMS. All four
+were closed as pure reads layered on the existing write paths — no migration,
+no new realtime event, no change to an existing response shape.
+
+```text
+GET /api/v1/tracking/:id  ──► findShipmentByIdentifier ──► trackingNumber, then
+                               (src/services/               reference, id, trailerId
+                                tracking-service.ts)         — first match wins
+
+GET /api/v1/yard/docking-queue ──► bucket by appointment window ──► recommendDocks
+     (src/services/                (no committed door yet)         (read-only,
+      docking-queue-service.ts)                                     per truck)
+
+GET /api/v1/docks/schedule        ──► forward timeline per door, scheduledStart asc
+     (src/services/dock-service.ts)
+
+GET /api/v1/yard/allocation-summary ──► committed assignments + unallocated trucks
+     (src/services/yard-service.ts)     + chainedFrom (reassignment provenance)
+```
+
+The docking queue is deliberately **not** an auto-assign path: it calls
+`recommendDocks`, the same side-effect-free function `GET
+/trucks/:id/dock-recommendations` uses, and writes nothing. A truck reaching
+`ARRIVED` gets surfaced in the queue with its top recommendation attached; the
+operator still presses `POST /trucks/:id/dock-assignment` to commit it (§2 —
+the backend decides the ranking, a human decides to act on it). Recommendations
+across a window's entries are fetched concurrently, and one truck the scorer
+can no longer resolve does not fail the whole request — it just gets no
+recommendation, logged rather than thrown.
+
+`TRUCK_ARRIVING` now has two independent writers reaching the same alert type:
+`SimulationManager.raiseArrivingAlert`, on the tick a truck's status flips to
+`ARRIVING`, and the WMS handler's existing `TRAILER_STATUS_UPDATED` path. This
+mirrors the project's `TRUCK_STATUS_CHANGED` pattern of one type, several
+writers, rather than adding a scenario-specific alert.
+
+**Null scheduled windows are bookings, not gaps.** `getDockSchedule`'s
+`from`/`to` range is an overlap filter, but `scheduledStart`/`scheduledEnd` are
+nullable and a Postgres range comparison never matches `NULL`. An assignment
+with no window is still occupying the door — `dockStillTakes` in the
+assignment engine already treats it that way when checking for a clash — so the
+schedule includes it unconditionally rather than letting a taken door read as
+free.
+
+---
+
 ## Lifecycle
 
 The simulation manager supports `start()`, `stop()`, `reset()`,
@@ -393,6 +448,11 @@ than one that says where the edges are.
   restores it afterwards. There is no separate test database. If a run is
   interrupted, `pnpm db:seed` is the reset.
 - **No authentication.** Not requested, and deliberately not added (§27).
+- **The docking queue scores every queued truck against every door on each
+  request** (§8) — `recommendDocks` reloads the yard per truck, run
+  concurrently but still O(trucks × docks) queries. Fine at the seeded scale
+  (12 trucks, 8 doors); a larger yard would want to hoist the dock load out of
+  the per-truck call.
 - **`typescript-eslint` does not support TypeScript 7** (upstream issue #10940),
   and this project is on `typescript@7.0.2`, so there is no linter configured.
   The strict compiler settings — `noUnusedLocals`, `noUncheckedIndexedAccess`,

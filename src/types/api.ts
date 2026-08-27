@@ -303,3 +303,53 @@ export interface AllocationSummaryResponse {
   allocations: AllocationEntry[];
   unallocated: UnallocatedTrailer[];
 }
+
+/* ------------------------------------------------------------------ fleet */
+
+export interface FleetRouteSummary {
+  id: string;
+  code: string;
+  name: string;
+  originName: string;
+  destinationName: string;
+  distanceKm: number;
+}
+
+export interface FleetShipmentSummary {
+  id: string;
+  reference: string;
+  trackingNumber: string;
+  customerName: string;
+  status: ShipmentStatus;
+  priority: Priority;
+  loadType: LoadType;
+  weightKg: number | null;
+  palletCount: number | null;
+}
+
+export interface FleetDockSummary {
+  id: string;
+  code: string;
+  name: string;
+  zone: string;
+  assignmentId: string;
+  assignmentStatus: AssignmentStatus;
+}
+
+export interface FleetTruck {
+  id: string;
+  reference: string;
+  trailerId: string;
+  carrier: string;
+  driverName: string;
+  driverPhone: string | null;
+  status: TruckStatus;
+  activeDelay: DelayScenario;
+  progress: number;
+  speedKmph: number;
+  eta: string | null;
+  lastUpdatedAt: string;
+  route: FleetRouteSummary | null;
+  shipment: FleetShipmentSummary | null;
+  dock: FleetDockSummary | null;
+}
