@@ -96,6 +96,22 @@ export interface ExternalUpdateResult {
   emitted: SimulationEventType[];
 }
 
+/**
+ * The loop's own state, as returned by `health()`. It is the body of the three
+ * lifecycle endpoints *and* of the read-only `GET /api/v1/simulation/status`.
+ * `lastTickError` means "is it broken *now*": per-truck tick failures are
+ * swallowed so one unusable truck cannot silence the rest (CLAUDE.md §22),
+ * which would otherwise make a wedged engine look identical to a healthy one
+ * from outside.
+ */
+export interface SimulationHealth {
+  running: boolean;
+  truckCount: number;
+  tickMs: number;
+  lastTickAt: string | null;
+  lastTickError: string | null;
+}
+
 interface TrackedTruck {
   state: LiveTruckState;
   profile: RouteProfile;
@@ -182,7 +198,7 @@ export class SimulationManager {
    * `lastTickError` holds the most recent per-truck failure and is cleared by
    * the first clean tick after it.
    */
-  health(): { running: boolean; truckCount: number; tickMs: number; lastTickAt: string | null; lastTickError: string | null } {
+  health(): SimulationHealth {
     return {
       running: this.isRunning(),
       truckCount: this.truckCount,

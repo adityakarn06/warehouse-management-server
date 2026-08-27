@@ -6,7 +6,7 @@ import { delayCommandSchema, truckIdParamSchema } from '../schemas/simulation.js
 import { multiplierFor } from '../simulation/delay-scenarios.js';
 import type { LiveTruckState } from '../simulation/live-state.js';
 import { toLiveTruckView } from '../simulation/live-state.js';
-import type { DelayResult } from '../simulation/simulation-manager.js';
+import type { DelayResult, SimulationHealth } from '../simulation/simulation-manager.js';
 import { simulationManager } from '../simulation/simulation-manager.js';
 
 /**
@@ -24,7 +24,7 @@ import { simulationManager } from '../simulation/simulation-manager.js';
  * swallowed to keep the interval alive (§22), which would otherwise make the
  * two indistinguishable from outside.
  */
-function status() {
+function status(): SimulationHealth {
   return simulationManager.health();
 }
 
@@ -40,6 +40,15 @@ export async function stopSimulation(_req: Request, res: Response): Promise<void
 
 export async function resetSimulation(_req: Request, res: Response): Promise<void> {
   await simulationManager.reset();
+  sendData(res, status());
+}
+
+/**
+ * The read-only member of the lifecycle family: same body as
+ * `start`/`stop`/`reset`, but it mutates nothing, so a dashboard can poll it —
+ * and it still answers once `beginShutdown()` has started 503ing non-GETs.
+ */
+export function getSimulationStatus(_req: Request, res: Response): void {
   sendData(res, status());
 }
 

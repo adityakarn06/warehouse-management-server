@@ -461,12 +461,16 @@ ARRIVED`. The loop starts on server boot unless `SIMULATION_AUTOSTART=false`
 | `POST` | `/api/v1/simulation/start` | Idempotent — a second call is ignored, never a second loop |
 | `POST` | `/api/v1/simulation/stop` | Stops the loop and flushes unpersisted movement |
 | `POST` | `/api/v1/simulation/reset` | Reload the world from the database, keeping the loop's running/stopped state. A full demo rewind is `pnpm db:seed` |
+| `GET` | `/api/v1/simulation/status` | The loop's own health — read-only, mutates nothing |
 | `GET` | `/api/v1/simulation/state` | Live state for every simulated truck |
 | `GET` | `/api/v1/simulation/trucks/:truckId` | One truck, by id or reference — including its current scenario |
 | `POST` | `/api/v1/simulation/trucks/:truckId/delay` | Activate a delay scenario |
 | `POST` | `/api/v1/simulation/trucks/:truckId/clear-delay` | Return the truck to normal speed |
 
-The three lifecycle endpoints return the same shape:
+The three lifecycle endpoints and `/status` all return the same shape — the
+difference is only that `/status` mutates nothing, so a dashboard can poll it,
+and it keeps answering after `beginShutdown()` has started 503ing non-GET
+requests:
 
 ```json
 {

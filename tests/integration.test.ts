@@ -611,6 +611,25 @@ describe('simulation lifecycle', () => {
     expect(health.body.data.tickMs).toBe(2000);
   });
 
+  it('reports the same health on GET /status without touching the loop', async () => {
+    await runTicks(1);
+
+    // `/status` is the read-only member of the lifecycle family: same body as
+    // start/stop/reset, but a dashboard can poll it without installing or
+    // tearing down an interval.
+    const running = await request(app).get('/api/v1/simulation/status').expect(200);
+    expect(running.body.data).toMatchObject({ running: true, truckCount: 9, tickMs: 2000 });
+    expect(running.body.data.lastTickAt).not.toBeNull();
+    expect(running.body.data.lastTickError).toBeNull();
+    expect(simulationManager.isRunning()).toBe(true);
+
+    // And it does not start one either.
+    await simulationManager.stop();
+    const stopped = await request(app).get('/api/v1/simulation/status').expect(200);
+    expect(stopped.body.data.running).toBe(false);
+    expect(simulationManager.isRunning()).toBe(false);
+  });
+
   it('lists every simulated truck on GET /state', async () => {
     await runTicks(1);
     const res = await state().expect(200);
@@ -727,6 +746,9 @@ describe('the shutdown command gate', () => {
     // Reads are harmless on the way down and stay open.
     await request(app).get('/api/v1/trucks/TRK-101').expect(200);
     await request(app).get('/health').expect(200);
+    // Including the loop's own health — `/status` is a GET precisely so an
+    // operator can still see what the engine is doing while it winds down.
+    await request(app).get('/api/v1/simulation/status').expect(200);
   });
 });
 
