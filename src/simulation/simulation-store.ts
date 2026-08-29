@@ -5,6 +5,7 @@ import type {
   TruckStatus,
 } from '../generated/prisma/enums.js';
 import { prisma } from '../lib/prisma.js';
+import { seedWorld } from '../seed/seed-world.js';
 import type { AlertRecord, CreateAlertInput } from '../services/alert-service.js';
 import { createAlert } from '../services/alert-service.js';
 import type { LiveTruckState } from './live-state.js';
@@ -40,12 +41,15 @@ export interface SimulationStore {
    */
   persist(state: LiveTruckState, reason: LocationSnapshotReason | null): Promise<void>;
   /**
-   * Write a set of truck rows back verbatim — the rewind behind
-   * `POST /simulation/reset`. Unlike `persist` this takes rows rather than live
-   * state (the baseline it restores is the row set a previous `loadTrucks()`
-   * returned) and writes no LocationHistory: a rewind is not a movement.
+   * Rewind the whole demo world to t0 — the rewind behind
+   * `POST /simulation/reset`.
+   *
+   * It rewrites the seeded world rather than the trucks the loop happens to be
+   * holding, because by the time an operator wants a reset the interesting
+   * trucks have usually ARRIVED — and an arrived truck is not in `loadTrucks()`
+   * at all, so anything driven off live state could never bring it back.
    */
-  restoreTrucks(rows: SimulationTruckRow[]): Promise<void>;
+  resetWorld(): Promise<void>;
   /**
    * Write one alert. On this interface rather than reached for directly so the
    * engine keeps a single injected database seam — the tests' fake store records
@@ -170,37 +174,10 @@ export const prismaSimulationStore: SimulationStore = {
     });
   },
 
-  async restoreTrucks(rows) {
-    // One transaction: a half-applied rewind would leave the fleet describing
-    // two different worlds, and the reload that follows would read it back.
-    await prisma.$transaction(async (tx) => {
-      for (const row of rows) {
-        await tx.truck.update({
-          where: { id: row.id },
-          data: {
-            currentLatitude: row.currentLatitude,
-            currentLongitude: row.currentLongitude,
-            progress: row.progress,
-            speedKmph: row.speedKmph,
-            eta: row.eta,
-            status: row.status,
-            activeDelay: row.activeDelay,
-            arrivedAt: row.arrivedAt,
-            lastUpdatedAt: new Date(),
-          },
-        });
-
-        // Same mirroring rule persist() follows, so a shipment dragged to
-        // ARRIVING/ARRIVED by the run being rewound goes back with its truck.
-        const shipmentStatus = SHIPMENT_STATUS_FOR_TRUCK[row.status];
-        if (shipmentStatus !== undefined && row.shipment !== null) {
-          await tx.shipment.update({
-            where: { id: row.shipment.id },
-            data: { status: shipmentStatus },
-          });
-        }
-      }
-    });
+  async resetWorld() {
+    // The one definition of t0, shared with `pnpm db:seed` — reset and re-seed
+    // must not be able to disagree about what the demo starts as.
+    await seedWorld(prisma);
   },
 
   async createAlert(input) {

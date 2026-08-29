@@ -132,15 +132,6 @@ export class SimulationManager {
    * until the count climbed back.
    */
   private readonly lastSequence = new Map<string, number>();
-  /**
-   * The world as it looked the first time it was loaded — the seeded state on a
-   * freshly booted server. `reset()` writes this back to the database before
-   * reloading, which is the whole of what makes reset a rewind: the rows the
-   * loop has been checkpointing since boot describe the *current* world, so
-   * reloading them would restore exactly the state being reset away from.
-   */
-  private baseline: SimulationTruckRow[] | null = null;
-
   private timer: NodeJS.Timeout | null = null;
   /** In-flight tick() *or* stop()'s flush, so callers queue instead of racing. */
   private inFlight: Promise<void> | null = null;
@@ -321,9 +312,13 @@ export class SimulationManager {
   }
 
   /**
-   * Stop, drop the in-memory world, reload it from the database, start again.
-   * Note this restores whatever the database currently holds — a full demo
-   * rewind is `pnpm db:seed`.
+   * Stop, rewind the demo world to t0, reload it, start again.
+   *
+   * The rewind is a re-seed (`store.resetWorld()` → `src/seed/seed-world.ts`),
+   * which is what makes this a reset an operator can actually see. Reloading
+   * the rows as they stand cannot be one: they are the checkpoints this very
+   * run has been writing, and by the time anyone presses reset the fleet has
+   * usually ARRIVED — a status `loadTrucks()` does not even select.
    */
   async reset(): Promise<void> {
     return this.enqueue(async () => {
@@ -348,17 +343,18 @@ export class SimulationManager {
       this.lastTickAt.clear();
       clearRouteProfileCache();
 
-      // Put the boot snapshot back before reloading. Without this the reload
-      // returns the checkpoints this run has been writing since boot — the
+      // Rewind the database itself, before reloading. Without this the reload
+      // returns the checkpoints this run has been writing all along — the
       // current world — and reset is a no-op the operator can see nothing of.
-      if (this.baseline !== null) {
-        try {
-          await this.deps.store.restoreTrucks(this.baseline);
-        } catch (error) {
-          // A failed rewind must still leave a loaded, consistent world rather
-          // than an empty one, so the reload below runs either way.
-          logger.error('Failed to restore the simulation baseline', error);
-        }
+      // It is the whole world, not just the loaded trucks: by the time anyone
+      // presses reset the interesting trucks have usually ARRIVED, and an
+      // arrived truck is not in `loadTrucks()` at all.
+      try {
+        await this.deps.store.resetWorld();
+      } catch (error) {
+        // A failed rewind must still leave a loaded, consistent world rather
+        // than an empty one, so the reload below runs either way.
+        logger.error('Failed to rewind the world', error);
       }
 
       if (wasRunning) {
@@ -851,13 +847,12 @@ export class SimulationManager {
     // is unusable is skipped and reported rather than aborting the load — one
     // bad route must not silently leave the fleet half-loaded (and, because
     // start() only loads when the map is empty, permanently so).
-    const loaded: { row: SimulationTruckRow; state: LiveTruckState; profile: RouteProfile }[] = [];
+    const loaded: { state: LiveTruckState; profile: RouteProfile }[] = [];
     const skipped: string[] = [];
 
     for (const row of rows) {
       try {
         loaded.push({
-          row,
           // Resume this truck's counter rather than restarting it at 0.
           state: toLiveState(
             row,
@@ -878,12 +873,6 @@ export class SimulationManager {
       this.lastTickAt.set(state.truckId, startedAt);
       this.profiles.set(state.truckId, profile);
     }
-
-    // The first load of the process is the baseline `reset()` rewinds to: on a
-    // freshly seeded demo it is the seeded world, and after that it is whatever
-    // the operator booted with. Captured after the skip filter so a truck with
-    // unusable geometry is not written back by a rewind that cannot load it.
-    this.baseline ??= loaded.map(({ row }) => row);
 
     logger.info(`Simulation loaded ${loaded.length} moving truck(s) from the database`);
     if (skipped.length > 0) {

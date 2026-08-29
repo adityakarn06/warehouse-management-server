@@ -73,17 +73,20 @@ interface PersistCall {
 class FakeStore implements SimulationStore {
   loadCount = 0;
   readonly persisted: PersistCall[] = [];
-  readonly restored: string[][] = [];
+  resetCount = 0;
   readonly alerts: CreateAlertInput[] = [];
   /** Set to make the next createAlert reject, to prove the delay still lands. */
   failAlerts = false;
   /** Set to hold createAlert open, so a tick can try to interleave with it. */
   alertGate: Promise<void> | null = null;
 
-  private readonly rows: Map<string, SimulationTruckRow>;
+  private rows: Map<string, SimulationTruckRow>;
+  /** The fake's "seed": what `resetWorld()` puts back, as `seedWorld` does. */
+  private readonly seeded: SimulationTruckRow[];
 
   constructor(rows: SimulationTruckRow[]) {
-    this.rows = new Map(rows.map((row) => [row.id, { ...row }]));
+    this.seeded = rows.map((row) => ({ ...row }));
+    this.rows = new Map(this.seeded.map((row) => [row.id, { ...row }]));
   }
 
   async loadTrucks(): Promise<SimulationTruckRow[]> {
@@ -119,9 +122,9 @@ class FakeStore implements SimulationStore {
     }
   }
 
-  async restoreTrucks(rows: SimulationTruckRow[]): Promise<void> {
-    this.restored.push(rows.map((row) => row.id));
-    for (const row of rows) this.rows.set(row.id, { ...row });
+  async resetWorld(): Promise<void> {
+    this.resetCount += 1;
+    this.rows = new Map(this.seeded.map((row) => [row.id, { ...row }]));
   }
 
   async createAlert(input: CreateAlertInput): Promise<AlertRecord> {
@@ -709,7 +712,7 @@ describe('simulation lifecycle', () => {
 
     await h.manager.reset();
 
-    expect(h.store.restored).toEqual([['TRK-TEST']]);
+    expect(h.store.resetCount).toBe(1);
     expect(h.manager.getTruckState('TRK-TEST')?.progress).toBe(0);
 
     // And the rewind is broadcast, so a dashboard that stayed subscribed is not
@@ -725,6 +728,30 @@ describe('simulation lifecycle', () => {
     // (the reloaded state is clean) and a fresh load still reads the baseline.
     await h.manager.stop();
     expect((await h.store.loadTrucks()).find((row) => row.id === 'TRK-TEST')?.progress).toBe(0);
+  });
+
+  it('puts an arrived fleet back on the road', async () => {
+    // The state an operator actually presses reset in: the demo has run long
+    // enough that everything has arrived. An arrived truck is not in
+    // `loadTrucks()` at all, so a rewind driven off live state could never
+    // bring it back — reset rewinds the world, not the loaded trucks.
+    const h = harness();
+    await h.manager.start();
+    await h.advance(ONE_HOUR * 2);
+    expect(h.manager.getTruckState('TRK-TEST')?.status).toBe('ARRIVED');
+
+    await h.manager.reset();
+
+    const truck = h.manager.getTruckState('TRK-TEST');
+    expect(truck?.status).toBe('IN_TRANSIT');
+    expect(truck?.progress).toBe(0);
+    expect(truck?.arrivedAt).toBeNull();
+
+    // And it advances again, rather than sitting at the origin.
+    await h.advance(ONE_HOUR / 6);
+    expect(h.manager.getTruckState('TRK-TEST')?.progress).toBeCloseTo(10, 4);
+
+    await h.manager.stop();
   });
 
   it('a reset of a stopped simulation reloads without starting the loop', async () => {
