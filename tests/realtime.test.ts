@@ -323,6 +323,10 @@ class NoopStore implements SimulationStore {
     // The realtime tests do not care where rows land.
   }
 
+  async restoreTrucks(_rows: SimulationTruckRow[]): Promise<void> {
+    // Nor where a reset puts them back.
+  }
+
   async createAlert(input: CreateAlertInput): Promise<AlertRecord> {
     return fakeAlertRecord(input);
   }

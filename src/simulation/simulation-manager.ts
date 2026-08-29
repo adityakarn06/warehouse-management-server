@@ -132,6 +132,14 @@ export class SimulationManager {
    * until the count climbed back.
    */
   private readonly lastSequence = new Map<string, number>();
+  /**
+   * The world as it looked the first time it was loaded — the seeded state on a
+   * freshly booted server. `reset()` writes this back to the database before
+   * reloading, which is the whole of what makes reset a rewind: the rows the
+   * loop has been checkpointing since boot describe the *current* world, so
+   * reloading them would restore exactly the state being reset away from.
+   */
+  private baseline: SimulationTruckRow[] | null = null;
 
   private timer: NodeJS.Timeout | null = null;
   /** In-flight tick() *or* stop()'s flush, so callers queue instead of racing. */
@@ -259,7 +267,13 @@ export class SimulationManager {
     return this.enqueue(() => this.runStop());
   }
 
-  private async runStop(): Promise<void> {
+  /**
+   * `flushDirty: false` is reset's path: it drains an in-flight tick and clears
+   * the interval, but deliberately does *not* write memory back. Flushing there
+   * would persist the very progress being discarded, and the reload that
+   * follows would read it straight back — a reset that resets nothing.
+   */
+  private async runStop(flushDirty = true): Promise<void> {
     const wasRunning = this.timer !== null;
 
     if (this.timer !== null) {
@@ -281,7 +295,7 @@ export class SimulationManager {
     // transaction that outlives stop(). Nothing awaits between the loop above
     // and the assignment below, which is what makes the claim safe (the same
     // reasoning `changeDelay` relies on).
-    const flushing = this.flush();
+    const flushing = flushDirty ? this.flush() : Promise.resolve(0);
     // The barrier must never reject: tick() and stop() await it.
     this.inFlight = flushing.then(
       () => undefined,
@@ -318,12 +332,34 @@ export class SimulationManager {
       // operator who stopped the simulation and then reset it must not find the
       // trucks moving again.
       const wasRunning = this.timer !== null;
+      // The statuses the world is being rewound *from*, so the
+      // `TRUCK_STATUS_CHANGED` below reports a real transition rather than
+      // claiming each truck changed from the status it just landed on.
+      const previousStatuses = new Map(
+        this.live.all().map((state) => [state.truckId, state.status] as const),
+      );
 
-      await this.runStop();
+      // `false`: do not flush. The dirty state being discarded is exactly what
+      // the rewind exists to throw away, and flushing it would write it to the
+      // rows the reload then reads back.
+      await this.runStop(false);
       this.live.clear();
       this.profiles.clear();
       this.lastTickAt.clear();
       clearRouteProfileCache();
+
+      // Put the boot snapshot back before reloading. Without this the reload
+      // returns the checkpoints this run has been writing since boot — the
+      // current world — and reset is a no-op the operator can see nothing of.
+      if (this.baseline !== null) {
+        try {
+          await this.deps.store.restoreTrucks(this.baseline);
+        } catch (error) {
+          // A failed rewind must still leave a loaded, consistent world rather
+          // than an empty one, so the reload below runs either way.
+          logger.error('Failed to restore the simulation baseline', error);
+        }
+      }
 
       if (wasRunning) {
         await this.runStart();
@@ -331,7 +367,30 @@ export class SimulationManager {
         // Still reload, so `GET /simulation/state` reflects the database.
         await this.load();
       }
+
+      // Every dashboard is now holding a world that no longer exists. The
+      // client that sent the command re-hydrates by re-subscribing, but every
+      // other one only ever learns about a truck through these events — so the
+      // rewind is broadcast like any other authoritative change.
+      this.emitRewind(previousStatuses);
     });
+  }
+
+  /** Announce the post-reset world to every subscriber. */
+  private emitRewind(previousStatuses: Map<string, TruckStatus>): void {
+    for (const state of this.live.all()) {
+      const profile = this.profiles.get(state.truckId);
+      if (!profile) continue;
+
+      // Past the high-water mark, or clients that survived the reset would drop
+      // the rewind as a stale update — the counter deliberately does not restart.
+      const next: LiveTruckState = { ...state, sequenceNumber: this.nextSequence(state.truckId) };
+      this.live.set(next);
+
+      this.emitPosition(next, profile);
+      this.emitEta(next);
+      this.emitStatus(next, previousStatuses.get(next.truckId) ?? next.status);
+    }
   }
 
   /**
@@ -792,12 +851,13 @@ export class SimulationManager {
     // is unusable is skipped and reported rather than aborting the load — one
     // bad route must not silently leave the fleet half-loaded (and, because
     // start() only loads when the map is empty, permanently so).
-    const loaded: { state: LiveTruckState; profile: RouteProfile }[] = [];
+    const loaded: { row: SimulationTruckRow; state: LiveTruckState; profile: RouteProfile }[] = [];
     const skipped: string[] = [];
 
     for (const row of rows) {
       try {
         loaded.push({
+          row,
           // Resume this truck's counter rather than restarting it at 0.
           state: toLiveState(
             row,
@@ -818,6 +878,12 @@ export class SimulationManager {
       this.lastTickAt.set(state.truckId, startedAt);
       this.profiles.set(state.truckId, profile);
     }
+
+    // The first load of the process is the baseline `reset()` rewinds to: on a
+    // freshly seeded demo it is the seeded world, and after that it is whatever
+    // the operator booted with. Captured after the skip filter so a truck with
+    // unusable geometry is not written back by a rewind that cannot load it.
+    this.baseline ??= loaded.map(({ row }) => row);
 
     logger.info(`Simulation loaded ${loaded.length} moving truck(s) from the database`);
     if (skipped.length > 0) {

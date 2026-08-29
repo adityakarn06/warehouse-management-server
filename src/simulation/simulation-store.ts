@@ -40,6 +40,13 @@ export interface SimulationStore {
    */
   persist(state: LiveTruckState, reason: LocationSnapshotReason | null): Promise<void>;
   /**
+   * Write a set of truck rows back verbatim — the rewind behind
+   * `POST /simulation/reset`. Unlike `persist` this takes rows rather than live
+   * state (the baseline it restores is the row set a previous `loadTrucks()`
+   * returned) and writes no LocationHistory: a rewind is not a movement.
+   */
+  restoreTrucks(rows: SimulationTruckRow[]): Promise<void>;
+  /**
    * Write one alert. On this interface rather than reached for directly so the
    * engine keeps a single injected database seam — the tests' fake store records
    * alerts the same way it records snapshots. The business logic itself lives in
@@ -159,6 +166,39 @@ export const prismaSimulationStore: SimulationStore = {
           where: { id: state.shipmentId },
           data: { status: shipmentStatus },
         });
+      }
+    });
+  },
+
+  async restoreTrucks(rows) {
+    // One transaction: a half-applied rewind would leave the fleet describing
+    // two different worlds, and the reload that follows would read it back.
+    await prisma.$transaction(async (tx) => {
+      for (const row of rows) {
+        await tx.truck.update({
+          where: { id: row.id },
+          data: {
+            currentLatitude: row.currentLatitude,
+            currentLongitude: row.currentLongitude,
+            progress: row.progress,
+            speedKmph: row.speedKmph,
+            eta: row.eta,
+            status: row.status,
+            activeDelay: row.activeDelay,
+            arrivedAt: row.arrivedAt,
+            lastUpdatedAt: new Date(),
+          },
+        });
+
+        // Same mirroring rule persist() follows, so a shipment dragged to
+        // ARRIVING/ARRIVED by the run being rewound goes back with its truck.
+        const shipmentStatus = SHIPMENT_STATUS_FOR_TRUCK[row.status];
+        if (shipmentStatus !== undefined && row.shipment !== null) {
+          await tx.shipment.update({
+            where: { id: row.shipment.id },
+            data: { status: shipmentStatus },
+          });
+        }
       }
     });
   },

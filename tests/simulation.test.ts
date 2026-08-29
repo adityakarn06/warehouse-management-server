@@ -64,16 +64,27 @@ interface PersistCall {
   reason: LocationSnapshotReason | null;
 }
 
+/**
+ * Write-through, like the real store: a persisted checkpoint changes what the
+ * next `loadTrucks()` returns. A fake that always handed back the original rows
+ * made `reset()` look like a rewind while production reset to the state it had
+ * just flushed.
+ */
 class FakeStore implements SimulationStore {
   loadCount = 0;
   readonly persisted: PersistCall[] = [];
+  readonly restored: string[][] = [];
   readonly alerts: CreateAlertInput[] = [];
   /** Set to make the next createAlert reject, to prove the delay still lands. */
   failAlerts = false;
   /** Set to hold createAlert open, so a tick can try to interleave with it. */
   alertGate: Promise<void> | null = null;
 
-  constructor(private readonly rows: SimulationTruckRow[]) {}
+  private readonly rows: Map<string, SimulationTruckRow>;
+
+  constructor(rows: SimulationTruckRow[]) {
+    this.rows = new Map(rows.map((row) => [row.id, { ...row }]));
+  }
 
   async loadTrucks(): Promise<SimulationTruckRow[]> {
     this.loadCount += 1;
@@ -81,7 +92,7 @@ class FakeStore implements SimulationStore {
     // concurrent-start test exercise the window between the guard and the
     // interval being installed.
     await Promise.resolve();
-    return this.rows.map((row) => ({ ...row }));
+    return [...this.rows.values()].map((row) => ({ ...row }));
   }
 
   async persist(state: LiveTruckState, reason: LocationSnapshotReason | null): Promise<void> {
@@ -91,6 +102,26 @@ class FakeStore implements SimulationStore {
       status: state.status,
       reason,
     });
+
+    const row = this.rows.get(state.truckId);
+    if (row) {
+      this.rows.set(state.truckId, {
+        ...row,
+        currentLatitude: state.latitude,
+        currentLongitude: state.longitude,
+        progress: state.progress,
+        speedKmph: state.speedKmph,
+        eta: state.eta,
+        status: state.status,
+        activeDelay: state.activeDelay,
+        arrivedAt: state.arrivedAt,
+      });
+    }
+  }
+
+  async restoreTrucks(rows: SimulationTruckRow[]): Promise<void> {
+    this.restored.push(rows.map((row) => row.id));
+    for (const row of rows) this.rows.set(row.id, { ...row });
   }
 
   async createAlert(input: CreateAlertInput): Promise<AlertRecord> {
@@ -657,10 +688,43 @@ describe('simulation lifecycle', () => {
     // Back to whatever the store reports — the fake still hands out progress 0.
     expect(h.manager.getTruckState('TRK-TEST')?.progress).toBe(0);
     // The sequence counter is per-run bookkeeping a connected client uses to
-    // drop stale updates, so a reset must not rewind it under that client.
-    expect(h.manager.getTruckState('TRK-TEST')?.sequenceNumber).toBe(sequenceBefore);
+    // drop stale updates, so a reset must not rewind it under that client. It
+    // moves *forward*: the rewind is broadcast like any other change, and an
+    // event at or below the client's high-water mark would be dropped.
+    expect(h.manager.getTruckState('TRK-TEST')?.sequenceNumber).toBeGreaterThan(sequenceBefore);
 
     await h.manager.stop();
+  });
+
+  it('rewinds a world the run has already checkpointed', async () => {
+    // The regression: reset used to stop (which flushes memory to the store),
+    // then reload — so it restored the very progress it was meant to discard.
+    // Checkpoint the truck well down the route first, so "reload from the
+    // store" and "rewind" are two visibly different answers.
+    const h = harness();
+    await h.manager.start();
+    await h.advance(ONE_HOUR / 2); // 30% in, past the 5% checkpoint step
+    expect(h.manager.getTruckState('TRK-TEST')?.progress).toBeCloseTo(30, 4);
+    expect(h.store.persisted.length).toBeGreaterThan(0);
+
+    await h.manager.reset();
+
+    expect(h.store.restored).toEqual([['TRK-TEST']]);
+    expect(h.manager.getTruckState('TRK-TEST')?.progress).toBe(0);
+
+    // And the rewind is broadcast, so a dashboard that stayed subscribed is not
+    // left rendering the world that was just discarded.
+    const positions = h.sink.ofType('TRUCK_POSITION_UPDATED');
+    expect(positions.at(-1)?.data.progress).toBe(0);
+    // Past the high-water mark, or a connected client drops it as stale.
+    expect(positions.at(-1)?.data.sequenceNumber).toBeGreaterThan(
+      positions.at(-2)?.data.sequenceNumber ?? 0,
+    );
+
+    // The rewind reached the store, not just memory: stopping flushes nothing
+    // (the reloaded state is clean) and a fresh load still reads the baseline.
+    await h.manager.stop();
+    expect((await h.store.loadTrucks()).find((row) => row.id === 'TRK-TEST')?.progress).toBe(0);
   });
 
   it('a reset of a stopped simulation reloads without starting the loop', async () => {
